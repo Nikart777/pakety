@@ -105,7 +105,7 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
         df = pd.read_excel(file_path)
     except Exception as e:
         print(f"Ошибка чтения Excel: {e}")
-        return None, None, None, None
+        return None, None, None, None, None
 
     # 1. Parsing dates
     df['dt_start'] = pd.to_datetime(df['Дата активации сессии'], dayfirst=True, errors='coerce')
@@ -124,8 +124,8 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
     sales_stats = {}
     dates_per_group = {} # {d_id: set(dates)}
 
-    # Hourly Occupancy: hourly_stats[zone][hour] = total_minutes_occupied
-    hourly_stats = {}
+    # Hourly Occupancy: daily_occupancy[date_str][zone][hour] = concurrent_count
+    daily_occupancy = {}
 
     # Retention
     phone_counts = {}
@@ -183,32 +183,64 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
             if pd.isnull(e):
                 e = s + pd.Timedelta(hours=est_duration)
 
-            # Simple hourly bucket fill
-            # We iterate from start hour to end hour
-            # Note: sessions can cross midnight.
+            # Iterate by hour
             curr = s
-            while curr < e:
-                h = curr.hour
-                if z_id not in hourly_stats: hourly_stats[z_id] = {i: 0 for i in range(24)}
-                hourly_stats[z_id][h] += 1
-                curr += pd.Timedelta(hours=1)
+            # Round down to start of hour
+            curr_h = curr.replace(minute=0, second=0, microsecond=0)
+
+            while curr_h < e:
+                # Use curr_h date and hour
+                d_str = curr_h.strftime('%Y-%m-%d')
+                h = curr_h.hour
+
+                # Check overlap: session [s, e], slot [curr_h, curr_h+1]
+                slot_end = curr_h + pd.Timedelta(hours=1)
+                overlap_start = max(s, curr_h)
+                overlap_end = min(e, slot_end)
+
+                # Count as occupied if significant overlap (e.g. > 1 min) or just exist
+                if overlap_end > overlap_start:
+                    if d_str not in daily_occupancy: daily_occupancy[d_str] = {}
+                    if z_id not in daily_occupancy[d_str]: daily_occupancy[d_str][z_id] = {i: 0 for i in range(24)}
+                    daily_occupancy[d_str][z_id][h] += 1
+
+                curr_h += pd.Timedelta(hours=1)
 
     # Convert sets to counts
     day_counts = {k: len(v) for k, v in dates_per_group.items()}
 
-    # Normalize hourly stats to "Avg Concurrent Users"
-    # Total Hits per Hour / Total Days in Dataset (Approx)
-    total_unique_days = len(set().union(*dates_per_group.values())) if dates_per_group else 1
+    # Aggregate Group Stats (Max & Avg)
+    # group_hourly_stats[d_id][zone][hour] = {'max': X, 'avg': Y}
+    group_hourly_stats = {}
 
-    normalized_hourly = {}
-    for z, hours in hourly_stats.items():
-        normalized_hourly[z] = {h: cnt / total_unique_days for h, cnt in hours.items()}
+    # Global Max for Heatmap
+    global_max_stats = {} # [zone][hour] = max
+
+    for d_id, dates in dates_per_group.items():
+        group_hourly_stats[d_id] = {}
+
+        for d_str in dates:
+            if d_str not in daily_occupancy: continue
+
+            for z, hours in daily_occupancy[d_str].items():
+                if z not in group_hourly_stats[d_id]: group_hourly_stats[d_id][z] = {h: {'max':0, 'sum':0, 'count':0} for h in range(24)}
+                if z not in global_max_stats: global_max_stats[z] = {h: 0 for h in range(24)}
+
+                for h, cnt in hours.items():
+                    # Update Group Stats
+                    stats = group_hourly_stats[d_id][z][h]
+                    stats['max'] = max(stats['max'], cnt)
+                    stats['sum'] += cnt
+                    stats['count'] += 1
+
+                    # Update Global Max
+                    global_max_stats[z][h] = max(global_max_stats[z][h], cnt)
 
     # Retention Rate
     repeats = sum(1 for c in phone_counts.values() if c > 1)
     retention_rate = (repeats / len(phone_counts) * 100) if phone_counts else 0
 
-    return sales_stats, day_counts, normalized_hourly, retention_rate
+    return sales_stats, day_counts, group_hourly_stats, global_max_stats, retention_rate
 
 # --- 3. РЕКОМЕНДАЦИИ И ОТЧЕТ ---
 def get_recommendation(peak_load_pct, avg_load_pct, bonus_share_pct, price, current_bonus_limit=0.15):
@@ -237,7 +269,7 @@ def get_recommendation(peak_load_pct, avg_load_pct, bonus_share_pct, price, curr
 
     return 'OK', price, ""
 
-def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_capacities, day_counts, hourly_stats, retention_rate):
+def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_capacities, day_counts, group_hourly_stats, global_max_stats, retention_rate):
     print("🎨 Рисуем отчет с доказательствами...")
 
     # --- CALCULATE AGGREGATES FOR DASHBOARD ---
@@ -270,26 +302,23 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
 
     # --- BUILD HEATMAP DATA ---
     # Rows: Zones, Cols: Hours 0-23
-    heatmap_html = "<div style='overflow-x:auto;'><h3>Карта Почасовой Загрузки (Среднее кол-во занятых ПК)</h3><table style='font-size:10px; width:100%; border-spacing: 2px; border-collapse: separate;'>"
+    heatmap_html = "<div style='overflow-x:auto;'><h3>Карта Максимальной Загрузки (Пик за период)</h3><table style='font-size:10px; width:100%; border-spacing: 2px; border-collapse: separate;'>"
     heatmap_html += "<tr><td style='width:100px;'></td>" + "".join([f"<td style='text-align:center; color:#888;'>{h:02d}</td>" for h in range(24)]) + "</tr>"
 
     for zid, zname in sorted(zones.items()):
-        if zid not in hourly_stats: continue
+        if zid not in global_max_stats: continue
         z_cap = zone_capacities.get(zid, 1)
         heatmap_html += f"<tr><td style='color:#ddd; font-weight:bold; text-align:right; padding-right:10px;'>{zname}</td>"
         for h in range(24):
-            val = hourly_stats[zid].get(h, 0)
+            val = global_max_stats[zid].get(h, 0)
             # intensity 0-1
             intensity = min(val / z_cap, 1.0) if z_cap > 0 else 0
-            # Color: From Dark (#222) to Red (#ff4d4d)
-            # Simple approach: R=255, G=255*(1-int), B=255*(1-int) for red scale?
-            # Or Blue (empty) to Red (Full).
-            # Let's do Green (Low) -> Yellow -> Red (High)
 
             bg = "#222"
-            val_fmt = f"{val:.1f}" if val > 0 else ""
+            val_fmt = f"{val}" if val > 0 else ""
 
-            if intensity > 0.8: bg = f"rgba(255, 77, 77, {intensity})" # Red
+            if intensity >= 0.9: bg = f"rgba(255, 0, 0, {intensity})" # Bright Red for >90%
+            elif intensity > 0.7: bg = f"rgba(255, 77, 77, {intensity})" # Red
             elif intensity > 0.4: bg = f"rgba(255, 234, 0, {intensity})" # Yellow
             elif intensity > 0: bg = f"rgba(0, 230, 118, {intensity})" # Green
 
@@ -512,19 +541,20 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                     if total_capacity_hours > 0:
                         avg_load_pct = int((hours_sold / total_capacity_hours) * 100)
 
-                    # Calculate PEAK Load for this slot
-                    # Day: 04-16, Evening: 17-03, Night: 22-08 (approx)
+                    # Calculate PEAK Load for this slot (based on this Day Group)
                     hours_to_check = []
                     if slot == 'day': hours_to_check = list(range(4, 17))
                     elif slot == 'evening': hours_to_check = list(range(17, 24)) + list(range(0, 4))
                     elif slot == 'night': hours_to_check = list(range(22, 24)) + list(range(0, 8))
 
                     max_occupancy = 0
-                    if zid in hourly_stats:
-                        for h in hours_to_check:
-                            max_occupancy = max(max_occupancy, hourly_stats[zid].get(h, 0))
+                    # Check group specific stats
+                    if did in group_hourly_stats and zid in group_hourly_stats[did]:
+                         for h in hours_to_check:
+                             # 'max' is the absolute peak recorded for this hour in this day group
+                             max_val = group_hourly_stats[did][zid].get(h, {}).get('max', 0)
+                             max_occupancy = max(max_occupancy, max_val)
 
-                    # hourly_stats values are already normalized to "Avg Concurrent Users"
                     peak_load_pct = int((max_occupancy / z_cap) * 100) if z_cap > 0 else 0
 
                     # Bonus Share
@@ -586,8 +616,8 @@ if __name__ == "__main__":
         print("❌ Ключ API не найден.")
     else:
         zones, targets, prices, dtypes, cal, pc_map, t_map, zone_caps = fetch_data()
-        stats, day_counts, hourly_stats, retention = analyze_excel(FILE_NAME, zones, targets, pc_map, t_map, cal)
+        stats, day_counts, group_stats, global_max, retention = analyze_excel(FILE_NAME, zones, targets, pc_map, t_map, cal)
         if stats:
-            generate_flyer_with_stats(zones, prices, stats, dtypes, zone_caps, day_counts, hourly_stats, retention)
+            generate_flyer_with_stats(zones, prices, stats, dtypes, zone_caps, day_counts, group_stats, global_max, retention)
         else:
             print("❌ Ошибка с Excel файлом")
