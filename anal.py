@@ -41,6 +41,7 @@ def fetch_data():
     keywords = {
         'базовый': '1_HOUR',
         '1 час': '1_HOUR',
+        '2 часа': '2_HOURS', # Added for Auto Sim
         '3 часа': '3_HOURS',
         '5 часов': '5_HOURS',
         'ночь': 'NIGHT'
@@ -50,9 +51,14 @@ def fetch_data():
         name_lower = t['name'].lower()
         if any(x in name_lower for x in ['абонемент', '24', '50', 'доплата']): continue
 
+        # Explicit check for Auto Sim to avoid mix-up with standard "1 hour"
+        is_autosim = 'автосим' in name_lower
+
         for kw, code in keywords.items():
             if kw in name_lower:
-                target_tariffs[t['id']] = {'name': t['name'], 'code': code}
+                # If autosim tariff, ensure code reflects it (though logic below handles zone separation)
+                # We just need to map it to a standardized code for aggregation
+                target_tariffs[t['id']] = {'name': t['name'], 'code': code, 'is_autosim': is_autosim}
                 break
 
     # Цены
@@ -134,7 +140,7 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
     # PC Revenue stats for "Worst PCs"
     pc_revenue = {} # {pc_name: {'cash':0, 'bonus':0, 'zone': z_id}}
 
-    duration_map = { '1_HOUR': 1, '3_HOURS': 3, '5_HOURS': 5, 'NIGHT': 10 }
+    duration_map = { '1_HOUR': 1, '2_HOURS': 2, '3_HOURS': 3, '5_HOURS': 5, 'NIGHT': 10 }
 
     for _, row in df.iterrows():
         pc = normalize_name(row.get('ПК'))
@@ -164,11 +170,17 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
 
         # --- TARIFF STATS ---
         if z_id and t_id in target_tariffs and d_id:
-            t_code = target_tariffs[t_id]['code']
+            t_data = target_tariffs[t_id]
+            t_code = t_data['code']
+            is_autosim = t_data.get('is_autosim', False)
             start_h = row['dt_start'].hour
 
-            time_slot = 'day' if 4 <= start_h < 17 else 'evening'
-            if t_code == 'NIGHT': time_slot = 'night'
+            if is_autosim:
+                # Autosim has no day/evening, just 'all_day'
+                time_slot = 'all_day'
+            else:
+                time_slot = 'day' if 4 <= start_h < 17 else 'evening'
+                if t_code == 'NIGHT': time_slot = 'night'
 
             if z_id not in sales_stats: sales_stats[z_id] = {}
             if t_code not in sales_stats[z_id]: sales_stats[z_id][t_code] = {}
@@ -176,7 +188,8 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
                 sales_stats[z_id][t_code][d_id] = {
                     'day': {'count':0, 'hours':0, 'cash':0, 'bonus':0},
                     'evening': {'count':0, 'hours':0, 'cash':0, 'bonus':0},
-                    'night': {'count':0, 'hours':0, 'cash':0, 'bonus':0}
+                    'night': {'count':0, 'hours':0, 'cash':0, 'bonus':0},
+                    'all_day': {'count':0, 'hours':0, 'cash':0, 'bonus':0} # For Autosim
                 }
 
             slot_data = sales_stats[z_id][t_code][d_id][time_slot]
@@ -517,7 +530,8 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
             <div class="legend">
                 <span style="color:#00e676">▲ ПОВЫСИТЬ</span> = Пик >90% или Ср. >70% &nbsp;|&nbsp;
                 <span style="color:#29b6f6">▼ АКЦИЯ</span> = Загрузка <20% &nbsp;|&nbsp;
-                <span style="color:#ffea00">★ БОНУСЫ</span> = Популярны бонусы
+                <span style="color:#ffea00">★ БОНУСЫ</span> = Популярны бонусы <br>
+                <span style="color:#ff6384">B: 15%</span> = Доля оплаты бонусами от выручки
             </div>
 
             <script>
@@ -544,12 +558,16 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
             </script>
     """
 
-    col_order = ['1_HOUR', '3_HOURS', '5_HOURS', 'NIGHT']
+    col_order_std = ['1_HOUR', '3_HOURS', '5_HOURS', 'NIGHT']
+    col_order_auto = ['1_HOUR', '2_HOURS', '3_HOURS']
 
     sorted_zones = sorted(zones.items(), key=lambda x: x[1])
 
     for zid, zname in sorted_zones:
         if zid not in price_grid: continue
+
+        is_autosim = 'авто' in zname.lower() or 'auto' in zname.lower()
+        col_order = col_order_auto if is_autosim else col_order_std
 
         html += f"""
         <div class="zone-card">
@@ -558,10 +576,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                 <thead>
                     <tr>
                         <th style="text-align:left; padding-left:20px;">День недели</th>
-                        <th>1 ЧАС</th>
-                        <th>3 ЧАСА</th>
-                        <th>5 ЧАСОВ</th>
-                        <th>НОЧЬ</th>
+                        {"".join([f"<th>{c}</th>" for c in col_order])}
                     </tr>
                 </thead>
                 <tbody>
@@ -577,15 +592,19 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                 data = price_grid[zid].get(t_code, {}).get(did, {})
                 # Use default structure for missing data
                 default_slot = {'count':0, 'hours':0, 'cash':0, 'bonus':0}
-                default_stats = {'day': default_slot.copy(), 'evening': default_slot.copy(), 'night': default_slot.copy()}
+                default_stats = {'day': default_slot.copy(), 'evening': default_slot.copy(), 'night': default_slot.copy(), 'all_day': default_slot.copy()}
 
                 stats = sales_stats.get(zid, {}).get(t_code, {}).get(did, default_stats)
 
                 # Capacity for this zone
                 z_cap = zone_capacities.get(zid, 1)
 
-                def render_cell(slot):
+                def render_cell(slot, label=None):
                     price = int(data.get(slot, 0))
+                    # Fallback for AutoSim if price is under 'day' in map but conceptually 'all_day'
+                    if price == 0 and slot == 'all_day':
+                        price = int(data.get('day', 0))
+
                     if price == 0: return "<span class='empty'>-</span>"
 
                     # СТАТИСТИКА
@@ -597,6 +616,8 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
 
                     # Calculate Load %
                     slot_hours_duration = 13 if slot == 'day' else (11 if slot == 'evening' else 10)
+                    if slot == 'all_day': slot_hours_duration = 24
+
                     # Use specific day count for this tariff group (did)
                     days_in_group = day_counts.get(did, 1)
                     total_capacity_hours = z_cap * slot_hours_duration * max(1, days_in_group)
@@ -610,6 +631,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                     if slot == 'day': hours_to_check = list(range(4, 17))
                     elif slot == 'evening': hours_to_check = list(range(17, 24)) + list(range(0, 4))
                     elif slot == 'night': hours_to_check = list(range(22, 24)) + list(range(0, 8))
+                    elif slot == 'all_day': hours_to_check = list(range(0, 24))
 
                     max_occupancy = 0
                     # Check group specific stats
@@ -640,31 +662,35 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                     elif rec_action == 'BONUS_UP':
                         rec_html = f"<div class='rec-badge rec-bonus-up'>★ BONUS</div>"
 
+                    label_html = f"<span class='time-label'>{label}</span>" if label else ""
+
                     return f"""
                     <div class="cell-container">
+                        {label_html}
                         {rec_html}
                         <span class="price-tag">{price}</span>
                         {stats_html}
                     </div>
                     """
 
-                if t_code == 'NIGHT':
-                    html += f"<td>{render_cell('night')}</td>"
+                if is_autosim:
+                    html += f"<td>{render_cell('all_day')}</td>"
                 else:
-                    html += f"""
-                    <td>
-                        <div class="split-row">
-                            <div class="split-col">
-                                <span class="time-label">День</span>
-                                {render_cell('day')}
+                    if t_code == 'NIGHT':
+                        html += f"<td>{render_cell('night')}</td>"
+                    else:
+                        html += f"""
+                        <td>
+                            <div class="split-row">
+                                <div class="split-col">
+                                    {render_cell('day', 'День')}
+                                </div>
+                                <div class="split-col">
+                                    {render_cell('evening', 'Вечер')}
+                                </div>
                             </div>
-                            <div class="split-col">
-                                <span class="time-label">Вечер</span>
-                                {render_cell('evening')}
-                            </div>
-                        </div>
-                    </td>
-                    """
+                        </td>
+                        """
             html += "</tr>"
         html += "</tbody></table></div>"
 
