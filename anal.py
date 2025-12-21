@@ -100,32 +100,37 @@ def fetch_data():
 
 # --- 2. АНАЛИЗ EXCEL ---
 def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar):
-    print("📂 Анализ продаж и подсчет чеков...")
+    print("📂 Анализ продаж и подсчет чеков (Почасовой анализ)...")
     try:
         df = pd.read_excel(file_path)
     except Exception as e:
         print(f"Ошибка чтения Excel: {e}")
-        return None, None
+        return None, None, None, None
 
+    # 1. Parsing dates
+    df['dt_start'] = pd.to_datetime(df['Дата активации сессии'], dayfirst=True, errors='coerce')
+    df['dt_end'] = pd.to_datetime(df['Дата завершения сессии'], dayfirst=True, errors='coerce')
+
+    # Fallback for old purchases logic if session data missing (though user confirmed it exists)
     if 'Дата покупки тарифа' in df.columns:
-        df['dt'] = pd.to_datetime(df['Дата покупки тарифа'], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['dt'])
+        df['dt_buy'] = pd.to_datetime(df['Дата покупки тарифа'], dayfirst=True, errors='coerce')
+        # If start is missing, use buy date
+        df['dt_start'] = df['dt_start'].fillna(df['dt_buy'])
 
-    df['hour'] = df['dt'].dt.hour
-    df['date_str'] = df['dt'].dt.strftime('%Y-%m-%d')
+    df = df.dropna(subset=['dt_start'])
+    df['date_str'] = df['dt_start'].dt.strftime('%Y-%m-%d')
 
-    # Структура для хранения данных
-    # stats[zone][tariff][date][slot] = { 'count': X, 'hours': Y, 'cash': Z, 'bonus': W }
+    # Structures
     sales_stats = {}
     dates_per_group = {} # {d_id: set(dates)}
 
-    # Mapping tariff codes to duration in hours
-    duration_map = {
-        '1_HOUR': 1,
-        '3_HOURS': 3,
-        '5_HOURS': 5,
-        'NIGHT': 10 # Assuming average night session impact
-    }
+    # Hourly Occupancy: hourly_stats[zone][hour] = total_minutes_occupied
+    hourly_stats = {}
+
+    # Retention
+    phone_counts = {}
+
+    duration_map = { '1_HOUR': 1, '3_HOURS': 3, '5_HOURS': 5, 'NIGHT': 10 }
 
     for _, row in df.iterrows():
         pc = normalize_name(row.get('ПК'))
@@ -134,19 +139,25 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
         t_id = t_name_map.get(t_name)
         d_id = calendar.get(row['date_str'])
 
+        # Phone stats
+        phone = str(row.get('Номер телефона гостя', ''))
+        if len(phone) > 5:
+            phone_counts[phone] = phone_counts.get(phone, 0) + 1
+
         if d_id and row['date_str']:
             if d_id not in dates_per_group: dates_per_group[d_id] = set()
             dates_per_group[d_id].add(row['date_str'])
 
-        # Получаем финансовые данные
+        # Financials
         cash = float(row.get('Списано рублей', 0) or 0)
         bonus = float(row.get('Списано бонусов', 0) or 0)
 
+        # --- TARIFF STATS ---
         if z_id and t_id in target_tariffs and d_id:
             t_code = target_tariffs[t_id]['code']
-            hour = row['hour']
+            start_h = row['dt_start'].hour
 
-            time_slot = 'day' if 4 <= hour < 17 else 'evening'
+            time_slot = 'day' if 4 <= start_h < 17 else 'evening'
             if t_code == 'NIGHT': time_slot = 'night'
 
             if z_id not in sales_stats: sales_stats[z_id] = {}
@@ -160,37 +171,73 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
 
             slot_data = sales_stats[z_id][t_code][d_id][time_slot]
             slot_data['count'] += 1
-            slot_data['hours'] += duration_map.get(t_code, 0)
+            est_duration = duration_map.get(t_code, 0)
+            slot_data['hours'] += est_duration
             slot_data['cash'] += cash
             slot_data['bonus'] += bonus
 
+            # --- HOURLY OCCUPANCY CALCULATION ---
+            # If we have end date, iterate hours. If not, estimate.
+            s = row['dt_start']
+            e = row['dt_end']
+            if pd.isnull(e):
+                e = s + pd.Timedelta(hours=est_duration)
+
+            # Simple hourly bucket fill
+            # We iterate from start hour to end hour
+            # Note: sessions can cross midnight.
+            curr = s
+            while curr < e:
+                h = curr.hour
+                if z_id not in hourly_stats: hourly_stats[z_id] = {i: 0 for i in range(24)}
+                hourly_stats[z_id][h] += 1
+                curr += pd.Timedelta(hours=1)
+
     # Convert sets to counts
     day_counts = {k: len(v) for k, v in dates_per_group.items()}
-    return sales_stats, day_counts
+
+    # Normalize hourly stats to "Avg Concurrent Users"
+    # Total Hits per Hour / Total Days in Dataset (Approx)
+    total_unique_days = len(set().union(*dates_per_group.values())) if dates_per_group else 1
+
+    normalized_hourly = {}
+    for z, hours in hourly_stats.items():
+        normalized_hourly[z] = {h: cnt / total_unique_days for h, cnt in hours.items()}
+
+    # Retention Rate
+    repeats = sum(1 for c in phone_counts.values() if c > 1)
+    retention_rate = (repeats / len(phone_counts) * 100) if phone_counts else 0
+
+    return sales_stats, day_counts, normalized_hourly, retention_rate
 
 # --- 3. РЕКОМЕНДАЦИИ И ОТЧЕТ ---
-def get_recommendation(load_pct, bonus_share_pct, price, current_bonus_limit=0.15):
+def get_recommendation(peak_load_pct, avg_load_pct, bonus_share_pct, price, current_bonus_limit=0.15):
     """
     Returns (action_code, new_price, reason)
-    action_code: 'UP', 'PROMO', 'BONUS_UP', 'BONUS_DOWN', 'OK'
+    Russian responses.
     """
-    # 1. Загрузка > 80% -> Поднимать цену + резать бонусы
-    if load_pct >= 80:
-        new_price = int(price * 1.15 / 10) * 10
-        return 'UP', new_price, f"High Demand ({load_pct}%)"
+    # 1. PEAK LOAD > 90% -> CRITICAL RAISE
+    if peak_load_pct >= 90:
+        new_price = int(price * 1.20 / 10) * 10
+        return 'UP', new_price, f"ПИКОВАЯ ЗАГРУЗКА ({int(peak_load_pct)}%) - СРОЧНО ПОДНЯТЬ"
 
-    # 2. Загрузка < 30% И Бонусами платят много (значит они есть у людей) -> Разрешить тратить больше бонусов
-    # Convert limit to percentage (e.g., 0.15 -> 15.0)
-    if load_pct <= 30 and bonus_share_pct >= (current_bonus_limit * 100 * 0.9):
-        return 'BONUS_UP', price, f"Low Load ({load_pct}%) & High Bonus Demand"
+    # 2. HIGH DEMAND (Avg > 70%) -> RAISE
+    if avg_load_pct >= 70:
+        new_price = int(price * 1.10 / 10) * 10
+        return 'UP', new_price, f"Высокий спрос ({int(avg_load_pct)}%)"
 
-    # 3. Загрузка < 20% -> Снижать цену (Promo)
-    if load_pct <= 20:
-        return 'PROMO', price, f"Critical Load ({load_pct}%)"
+    # 3. LOW LOAD + HIGH BONUS DEMAND -> ALLOW MORE BONUSES
+    limit_pct = current_bonus_limit * 100
+    if avg_load_pct <= 30 and bonus_share_pct >= (limit_pct * 0.9):
+        return 'BONUS_UP', price, f"Низкая загр. ({int(avg_load_pct)}%), но бонусы популярны. Увеличьте лимит."
+
+    # 4. CRITICAL LOW LOAD -> PROMO
+    if avg_load_pct <= 20 and peak_load_pct < 50:
+        return 'PROMO', price, f"Простой ПК ({int(avg_load_pct)}%). Нужна акция."
 
     return 'OK', price, ""
 
-def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_capacities, day_counts):
+def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_capacities, day_counts, hourly_stats, retention_rate):
     print("🎨 Рисуем отчет с доказательствами...")
 
     # --- CALCULATE AGGREGATES FOR DASHBOARD ---
@@ -221,10 +268,39 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
     total_revenue = total_revenue_cash + total_revenue_bonus
     bonus_share_global = (total_revenue_bonus / total_revenue * 100) if total_revenue else 0
 
+    # --- BUILD HEATMAP DATA ---
+    # Rows: Zones, Cols: Hours 0-23
+    heatmap_html = "<div style='overflow-x:auto;'><h3>Карта Почасовой Загрузки (Среднее кол-во занятых ПК)</h3><table style='font-size:10px; width:100%; border-spacing: 2px; border-collapse: separate;'>"
+    heatmap_html += "<tr><td style='width:100px;'></td>" + "".join([f"<td style='text-align:center; color:#888;'>{h:02d}</td>" for h in range(24)]) + "</tr>"
+
+    for zid, zname in sorted(zones.items()):
+        if zid not in hourly_stats: continue
+        z_cap = zone_capacities.get(zid, 1)
+        heatmap_html += f"<tr><td style='color:#ddd; font-weight:bold; text-align:right; padding-right:10px;'>{zname}</td>"
+        for h in range(24):
+            val = hourly_stats[zid].get(h, 0)
+            # intensity 0-1
+            intensity = min(val / z_cap, 1.0) if z_cap > 0 else 0
+            # Color: From Dark (#222) to Red (#ff4d4d)
+            # Simple approach: R=255, G=255*(1-int), B=255*(1-int) for red scale?
+            # Or Blue (empty) to Red (Full).
+            # Let's do Green (Low) -> Yellow -> Red (High)
+
+            bg = "#222"
+            val_fmt = f"{val:.1f}" if val > 0 else ""
+
+            if intensity > 0.8: bg = f"rgba(255, 77, 77, {intensity})" # Red
+            elif intensity > 0.4: bg = f"rgba(255, 234, 0, {intensity})" # Yellow
+            elif intensity > 0: bg = f"rgba(0, 230, 118, {intensity})" # Green
+
+            heatmap_html += f"<td style='background:{bg}; color:white; text-align:center; padding:4px; border-radius:2px;'>{val_fmt}</td>"
+        heatmap_html += "</tr>"
+    heatmap_html += "</table></div>"
+
     html = f"""
     <html>
     <head>
-        <title>CyberX Smart Pricing v2.0</title>
+        <title>CyberX Аналитика v2.0</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body {{
@@ -243,8 +319,8 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
             .kpi-label {{ font-size: 12px; text-transform: uppercase; color: #888; }}
 
             /* Charts */
-            .charts-row {{ display: flex; gap: 20px; margin-bottom: 40px; height: 300px; }}
-            .chart-container {{ flex: 1; background: #1e1e1e; padding: 15px; border-radius: 8px; }}
+            .charts-row {{ display: flex; gap: 20px; margin-bottom: 40px; }}
+            .chart-container {{ flex: 1; background: #1e1e1e; padding: 15px; border-radius: 8px; min-height:300px; }}
 
             .legend {{ text-align: center; color: #aaa; margin-bottom: 20px; font-size: 14px; border-top: 1px solid #333; padding-top: 20px; }}
 
@@ -315,7 +391,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
     </head>
     <body>
         <div class="container">
-            <h1>Умный Прайс-Лист 2.0 (Analytics)</h1>
+            <h1>Умный Прайс-Лист (Аналитика)</h1>
 
             <div class="dashboard">
                 <div class="kpi-card">
@@ -330,19 +406,25 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                     <div class="kpi-val">{int(bonus_share_global)}%</div>
                     <div class="kpi-label">Доля бонусов (Avg)</div>
                 </div>
+                <div class="kpi-card">
+                    <div class="kpi-val">{int(retention_rate)}%</div>
+                    <div class="kpi-label">Возврат клиентов (Retention)</div>
+                </div>
             </div>
 
             <div class="charts-row">
-                <div class="chart-container">
+                <div class="chart-container" style="flex:0 0 300px;">
                     <canvas id="revChart"></canvas>
                 </div>
-                <!-- Placeholder for future charts -->
+                <div class="chart-container">
+                    {heatmap_html}
+                </div>
             </div>
 
             <div class="legend">
-                <span style="color:#00e676">▲ PRICE UP</span> = High Load >80% &nbsp;|&nbsp;
-                <span style="color:#29b6f6">▼ PROMO</span> = Low Load <20% &nbsp;|&nbsp;
-                <span style="color:#ffea00">★ BONUS UP</span> = Low Load but High Bonus Usage
+                <span style="color:#00e676">▲ ПОВЫСИТЬ</span> = Пик >90% или Ср. >70% &nbsp;|&nbsp;
+                <span style="color:#29b6f6">▼ АКЦИЯ</span> = Загрузка <20% &nbsp;|&nbsp;
+                <span style="color:#ffea00">★ БОНУСЫ</span> = Популярны бонусы
             </div>
 
             <script>
@@ -350,7 +432,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                 new Chart(ctx, {{
                     type: 'doughnut',
                     data: {{
-                        labels: ['Cash', 'Bonuses'],
+                        labels: ['Рубли', 'Бонусы'],
                         datasets: [{{
                             data: [{int(total_revenue_cash)}, {int(total_revenue_bonus)}],
                             backgroundColor: ['#36a2eb', '#ff6384'],
@@ -361,8 +443,8 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                         responsive: true,
                         maintainAspectRatio: false,
                         plugins: {{
-                            legend: {{ position: 'right', labels: {{ color: 'white' }} }},
-                            title: {{ display: true, text: 'Revenue Split', color: 'white' }}
+                            legend: {{ position: 'bottom', labels: {{ color: 'white' }} }},
+                            title: {{ display: true, text: 'Выручка', color: 'white' }}
                         }}
                     }}
                 }});
@@ -426,18 +508,33 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                     days_in_group = day_counts.get(did, 1)
                     total_capacity_hours = z_cap * slot_hours_duration * max(1, days_in_group)
 
-                    load_pct = 0
+                    avg_load_pct = 0
                     if total_capacity_hours > 0:
-                        load_pct = int((hours_sold / total_capacity_hours) * 100)
+                        avg_load_pct = int((hours_sold / total_capacity_hours) * 100)
+
+                    # Calculate PEAK Load for this slot
+                    # Day: 04-16, Evening: 17-03, Night: 22-08 (approx)
+                    hours_to_check = []
+                    if slot == 'day': hours_to_check = list(range(4, 17))
+                    elif slot == 'evening': hours_to_check = list(range(17, 24)) + list(range(0, 4))
+                    elif slot == 'night': hours_to_check = list(range(22, 24)) + list(range(0, 8))
+
+                    max_occupancy = 0
+                    if zid in hourly_stats:
+                        for h in hours_to_check:
+                            max_occupancy = max(max_occupancy, hourly_stats[zid].get(h, 0))
+
+                    # hourly_stats values are already normalized to "Avg Concurrent Users"
+                    peak_load_pct = int((max_occupancy / z_cap) * 100) if z_cap > 0 else 0
 
                     # Bonus Share
                     total_paid = cash + bonus
                     bonus_share = (bonus / total_paid * 100) if total_paid > 0 else 0
 
                     # Recommendation
-                    rec_action, rec_price, rec_reason = get_recommendation(load_pct, bonus_share, price)
+                    rec_action, rec_price, rec_reason = get_recommendation(peak_load_pct, avg_load_pct, bonus_share, price)
 
-                    stats_html = f"<span class='stats-info'>({int(hours_sold)}h / {load_pct}%)</span>"
+                    stats_html = f"<span class='stats-info'>Av:{avg_load_pct}% / Pk:{peak_load_pct}%</span>"
                     # Add bonus info if significant
                     if bonus_share > 5:
                          stats_html += f"<br><span class='stats-info' style='color:#ff6384'>B: {int(bonus_share)}%</span>"
@@ -489,8 +586,8 @@ if __name__ == "__main__":
         print("❌ Ключ API не найден.")
     else:
         zones, targets, prices, dtypes, cal, pc_map, t_map, zone_caps = fetch_data()
-        stats, day_counts = analyze_excel(FILE_NAME, zones, targets, pc_map, t_map, cal)
+        stats, day_counts, hourly_stats, retention = analyze_excel(FILE_NAME, zones, targets, pc_map, t_map, cal)
         if stats:
-            generate_flyer_with_stats(zones, prices, stats, dtypes, zone_caps, day_counts)
+            generate_flyer_with_stats(zones, prices, stats, dtypes, zone_caps, day_counts, hourly_stats, retention)
         else:
             print("❌ Ошибка с Excel файлом")
