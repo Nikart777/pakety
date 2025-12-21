@@ -166,8 +166,57 @@ if __name__ == "__main__":
     # --- GENERATE REPORT ---
     print("🎨 Generating Time Analysis Report...")
 
-    # Iterate Zones -> Day Types -> Tariffs
-    # Create a subplot for each Zone/DayType combo? Or just one big report with many charts.
+    # --- RECOMMENDATION ENGINE ---
+    # summary_rows = list of dicts {zone, tariff, current, rec, reason, benefit}
+    summary_rows = []
+
+    for zid, zname in z_map.items():
+        if zid not in usage: continue
+        for did, dname in d_types.items():
+            if did not in usage[zid]: continue
+
+            for tid, hours_data in usage[zid][did].items():
+                tname = t_map.get(tid, f"ID {tid}")
+                res = limits.get(zid, {}).get(did, {}).get(tid)
+                if not res: continue
+
+                start, end = res['start'], res['end']
+                s_int, e_int = int(start), int(end)
+
+                # 1. CHECK CLIFF EFFECT (Extend TO?)
+                # Look at 2 hours after close
+                post_sales = hours_data.get(e_int, 0) + hours_data.get(e_int+1, 0)
+                pre_sales = hours_data.get(e_int-1, 0) + hours_data.get(e_int-2, 0)
+
+                if post_sales > (pre_sales * 1.5) and post_sales > 5:
+                    summary_rows.append({
+                        'zone': zname,
+                        'day': dname,
+                        'tariff': tname,
+                        'current': f"{s_int:02d}:00 - {e_int:02d}:00",
+                        'rec': f"Продлить до {e_int+2}:00",
+                        'reason': f"Всплеск ({int(post_sales)} чек.) сразу после закрытия.",
+                        'score': int(post_sales * 100) # Dummy score, implies revenue potential
+                    })
+
+                # 2. CHECK DEAD START (Shift FROM?)
+                # Look at first 2 hours
+                start_sales = hours_data.get(s_int, 0) + hours_data.get(s_int+1, 0)
+                peak_sales = max(hours_data.values()) if hours_data else 0
+
+                if start_sales == 0 and peak_sales > 5:
+                     summary_rows.append({
+                        'zone': zname,
+                        'day': dname,
+                        'tariff': tname,
+                        'current': f"{s_int:02d}:00 - {e_int:02d}:00",
+                        'rec': f"Сдвинуть начало на {s_int+2}:00",
+                        'reason': "Нет продаж в первые 2 часа.",
+                        'score': 0 # Efficiency gain, not revenue
+                    })
+
+    # --- GENERATE REPORT ---
+    print("🎨 Generating Time Analysis Report...")
 
     html_content = """
     <html>
@@ -175,15 +224,58 @@ if __name__ == "__main__":
         <title>CyberX Time Analysis</title>
         <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
-            body { background-color: #121212; color: #e0e0e0; font-family: sans-serif; padding: 20px; }
+            body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; padding: 20px; }
             .card { background: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; padding: 15px; border-radius: 8px; }
-            h2 { color: #ff4d4d; }
-            h3 { color: #aaa; margin-top: 0; }
-            .chart-box { height: 400px; }
+            h2 { color: #ff4d4d; margin-top:0; }
+            h3 { color: #aaa; margin-top: 0; font-size:14px; }
+            .chart-box { height: 350px; }
+
+            table { width: 100%; border-collapse: collapse; margin-bottom: 40px; background: #1e1e1e; }
+            th { background: #2a2a2a; color: #fff; padding: 12px; text-align: left; border-bottom: 2px solid #ff4d4d; }
+            td { padding: 10px; border-bottom: 1px solid #333; color: #ddd; }
+            tr:hover td { background: #252525; }
+            .badge-ext { background: #00e676; color: black; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+            .badge-shf { background: #29b6f6; color: black; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
         </style>
     </head>
     <body>
         <h1>Анализ Временных Границ Тарифов</h1>
+
+        <div class="card">
+            <h2>⚡ Сводная Таблица Рекомендаций</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Зона / День</th>
+                        <th>Тариф</th>
+                        <th>Сейчас</th>
+                        <th>Рекомендация</th>
+                        <th>Причина</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+
+    if not summary_rows:
+        html_content += "<tr><td colspan='5' style='text-align:center; padding:20px;'>Нет явных рекомендаций по изменению времени.</td></tr>"
+    else:
+        # Sort by score desc
+        for row in sorted(summary_rows, key=lambda x: x['score'], reverse=True):
+            badge_cls = "badge-ext" if "Продлить" in row['rec'] else "badge-shf"
+            html_content += f"""
+            <tr>
+                <td><b>{row['zone']}</b><br><span style='font-size:10px; color:#888'>{row['day']}</span></td>
+                <td>{row['tariff']}</td>
+                <td>{row['current']}</td>
+                <td><span class='{badge_cls}'>{row['rec']}</span></td>
+                <td>{row['reason']}</td>
+            </tr>
+            """
+
+    html_content += """
+                </tbody>
+            </table>
+        </div>
     """
 
     for zid, zname in z_map.items():
