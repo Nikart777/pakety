@@ -18,6 +18,12 @@ LOW_LOAD_THRESHOLD = 0.20   # Если продаж < 20% от рекорда ->
 def normalize_name(val):
     return str(val).strip().lower()
 
+def get_cutoff_hour(t_code):
+    """Returns the hour where Day ends and Evening starts."""
+    if t_code == '5_HOURS': return 14
+    if t_code == '3_HOURS': return 16
+    return 17
+
 def safe_request(endpoint):
     headers = {'X-API-KEY': API_KEY, 'accept': 'application/json'}
     try:
@@ -74,9 +80,11 @@ def fetch_data():
         if tid not in target_tariffs: continue
         t_code = target_tariffs[tid]['code']
 
-        # Определяем слот: День (04:00-17:00) или Вечер (17:00-04:00)
+        # Определяем слот: День или Вечер (динамический порог)
         t_start = int(p.get('time_from', '00').split(':')[0])
-        time_slot = 'day' if 4 <= t_start < 17 else 'evening'
+        cutoff = get_cutoff_hour(t_code)
+
+        time_slot = 'day' if 4 <= t_start < cutoff else 'evening'
         if t_code == 'NIGHT': time_slot = 'night'
 
         if zid not in price_grid: price_grid[zid] = {}
@@ -179,7 +187,8 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
                 # Autosim has no day/evening, just 'all_day'
                 time_slot = 'all_day'
             else:
-                time_slot = 'day' if 4 <= start_h < 17 else 'evening'
+                cutoff = get_cutoff_hour(t_code)
+                time_slot = 'day' if 4 <= start_h < cutoff else 'evening'
                 if t_code == 'NIGHT': time_slot = 'night'
 
             if z_id not in sales_stats: sales_stats[z_id] = {}
@@ -629,10 +638,16 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
 
                     # Calculate PEAK Load for this slot (based on this Day Group)
                     hours_to_check = []
-                    if slot == 'day': hours_to_check = list(range(4, 17))
-                    elif slot == 'evening': hours_to_check = list(range(17, 24)) + list(range(0, 4))
-                    elif slot == 'night': hours_to_check = list(range(22, 24)) + list(range(0, 8))
-                    elif slot == 'all_day': hours_to_check = list(range(0, 24))
+                    cutoff = get_cutoff_hour(t_code) # Use dynamic cutoff for load check too
+
+                    if slot == 'day':
+                        hours_to_check = list(range(4, cutoff))
+                    elif slot == 'evening':
+                        hours_to_check = list(range(cutoff, 24)) + list(range(0, 4))
+                    elif slot == 'night':
+                        hours_to_check = list(range(22, 24)) + list(range(0, 8))
+                    elif slot == 'all_day':
+                        hours_to_check = list(range(0, 24))
 
                     max_occupancy = 0
                     # Check group specific stats
