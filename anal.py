@@ -125,7 +125,7 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
     sales_stats = {}
     dates_per_group = {} # {d_id: set(dates)}
 
-    # Hourly Occupancy: daily_occupancy[date_str][zone][hour] = concurrent_count
+    # Hourly Occupancy: daily_occupancy[date_str][zone][hour] = total_minutes_occupied
     daily_occupancy = {}
 
     # Retention
@@ -208,11 +208,12 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
                 overlap_start = max(s, curr_h)
                 overlap_end = min(e, slot_end)
 
-                # Count as occupied if significant overlap (e.g. > 1 min) or just exist
-                if overlap_end > overlap_start:
+                duration = (overlap_end - overlap_start).total_seconds() / 60.0
+
+                if duration > 0:
                     if d_str not in daily_occupancy: daily_occupancy[d_str] = {}
                     if z_id not in daily_occupancy[d_str]: daily_occupancy[d_str][z_id] = {i: 0 for i in range(24)}
-                    daily_occupancy[d_str][z_id][h] += 1
+                    daily_occupancy[d_str][z_id][h] += duration
 
                 curr_h += pd.Timedelta(hours=1)
 
@@ -236,15 +237,21 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
                 if z not in group_hourly_stats[d_id]: group_hourly_stats[d_id][z] = {h: {'max':0, 'sum':0, 'count':0} for h in range(24)}
                 if z not in global_max_stats: global_max_stats[z] = {h: 0 for h in range(24)}
 
-                for h, cnt in hours.items():
+                for h, minutes_sum in hours.items():
+                    # Convert total minutes for ALL PCs in this zone/hour to avg concurrency
+                    # If 15 PCs, max minutes = 15 * 60 = 900.
+                    # Concurrency = minutes_sum / 60.
+
+                    conc = minutes_sum / 60.0
+
                     # Update Group Stats
                     stats = group_hourly_stats[d_id][z][h]
-                    stats['max'] = max(stats['max'], cnt)
-                    stats['sum'] += cnt
+                    stats['max'] = max(stats['max'], conc)
+                    stats['sum'] += conc
                     stats['count'] += 1
 
                     # Update Global Max
-                    global_max_stats[z][h] = max(global_max_stats[z][h], cnt)
+                    global_max_stats[z][h] = max(global_max_stats[z][h], conc)
 
     # Retention Rate
     repeats = sum(1 for c in phone_counts.values() if c > 1)
@@ -273,9 +280,10 @@ def get_recommendation(peak_load_pct, avg_load_pct, bonus_share_pct, price, curr
     if avg_load_pct <= 30 and bonus_share_pct >= (limit_pct * 0.9):
         return 'BONUS_UP', price, f"Низкая загр. ({int(avg_load_pct)}%), но бонусы популярны. Увеличьте лимит."
 
-    # 4. CRITICAL LOW LOAD -> PROMO
+    # 4. CRITICAL LOW LOAD -> PROMO (LOWER PRICE)
     if avg_load_pct <= 20 and peak_load_pct < 50:
-        return 'PROMO', price, f"Простой ПК ({int(avg_load_pct)}%). Нужна акция."
+        new_price = int(price * 0.9 / 10) * 10
+        return 'PROMO', new_price, f"Простой ПК ({int(avg_load_pct)}%). Снизьте цену."
 
     return 'OK', price, ""
 
@@ -376,7 +384,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                 elif intensity > 0.4: bg = f"rgba(255, 234, 0, {intensity})"
                 elif intensity > 0: bg = f"rgba(0, 230, 118, {intensity})"
 
-                heatmap_html += f"<td style='background:{bg}; color:white; text-align:center; padding:4px; border-radius:2px;'>{val_fmt}</td>"
+                heatmap_html += f"<td style='background:{bg}; color:white; text-align:center; padding:4px; border-radius:2px;'>{int(val)}</td>"
             heatmap_html += "</tr>"
         heatmap_html += "</table></div>"
 
@@ -621,15 +629,14 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                     rec_action, rec_price, rec_reason = get_recommendation(peak_load_pct, avg_load_pct, bonus_share, price)
 
                     stats_html = f"<span class='stats-info'>Av:{avg_load_pct}% / Pk:{peak_load_pct}%</span>"
-                    # Add bonus info if significant
-                    if bonus_share > 5:
-                         stats_html += f"<br><span class='stats-info' style='color:#ff6384'>B: {int(bonus_share)}%</span>"
+                    # Add bonus info ALWAYS
+                    stats_html += f"<br><span class='stats-info' style='color:#ff6384'>B: {int(bonus_share)}%</span>"
 
                     rec_html = ""
                     if rec_action == 'UP':
                         rec_html = f"<div class='rec-badge rec-up'>▲ {rec_price}</div>"
                     elif rec_action == 'PROMO':
-                        rec_html = f"<div class='rec-badge rec-promo'>PROMO</div>"
+                        rec_html = f"<div class='rec-badge rec-promo'>▼ {rec_price}</div>"
                     elif rec_action == 'BONUS_UP':
                         rec_html = f"<div class='rec-badge rec-bonus-up'>★ BONUS</div>"
 
