@@ -110,25 +110,41 @@ def analyze_time_distribution(file_path, zones, pc_map):
     df['hour'] = df['dt_buy'].dt.hour + df['dt_buy'].dt.minute/60.0
 
     # Data Structure:
-    # stats[ZoneType][TariffType] = List of purchase hours
-    stats = {
-        'STANDARD': {'1_HOUR': [], '3_HOURS': [], '5_HOURS': [], 'NIGHT': []},
-        'CONSOLE': {'1_HOUR': [], '3_HOURS': [], '5_HOURS': [], 'NIGHT': []}
-    }
+    # stats[ZoneName] = { 'type': 'STANDARD'/'CONSOLE', 'tariffs': { '1_HOUR': [], ... } }
+    stats = {}
 
     for _, row in df.iterrows():
         pc = str(row.get('ПК')).lower().strip()
 
-        # Determine Zone Type (Fallback to PC name if API failed)
-        z_type = 'STANDARD'
+        # Determine Zone Name and Type
+        z_name = "Unknown Zone"
+        z_type = "STANDARD"
 
         z_id = pc_map.get(pc)
-        if z_id:
-            z_name = zones.get(z_id, "")
+        if z_id and z_id in zones:
+            z_name = zones[z_id]
             z_type = classify_zone(z_name)
         else:
-            # Fallback: Classify by PC name
-            z_type = classify_zone(pc)
+            # Fallback Grouping Logic if API failed or PC not linked
+            if 'auto' in pc:
+                z_name = "Auto Simulators"
+                z_type = "CONSOLE"
+            elif 'ps' in pc or 'vip' in pc or 'std' in pc:
+                # Group PS by their specific name if possible
+                z_name = row.get('ПК').strip() # Use original case
+                z_type = "CONSOLE"
+            elif pc.isdigit():
+                z_name = "Main Hall (PCs)"
+                z_type = "STANDARD"
+            else:
+                z_name = f"Other ({pc})"
+                z_type = classify_zone(pc)
+
+        if z_name not in stats:
+            stats[z_name] = {
+                'type': z_type,
+                'tariffs': {'1_HOUR': [], '3_HOURS': [], '5_HOURS': [], 'NIGHT': []}
+            }
 
         t_name = str(row.get('Название тарифа')).lower()
         t_type = None
@@ -138,16 +154,20 @@ def analyze_time_distribution(file_path, zones, pc_map):
                 t_type = v
                 break
 
-        if t_type and t_type in stats[z_type]:
-            stats[z_type][t_type].append(row['hour'])
+        if t_type and t_type in stats[z_name]['tariffs']:
+            stats[z_name]['tariffs'][t_type].append(row['hour'])
 
     return stats
 
 def generate_recommendations(stats):
     recommendations = []
 
-    for z_type, tariffs in stats.items():
-        rules = RULES[z_type]
+    for z_name, data in stats.items():
+        z_type = data['type']
+        tariffs = data['tariffs']
+
+        # Use rules based on Type
+        rules = RULES.get(z_type, RULES['STANDARD'])
 
         for t_type, hours in tariffs.items():
             if not hours: continue
@@ -160,7 +180,7 @@ def generate_recommendations(stats):
             total_sales = len(hours)
 
             # --- MORNING CUTOFF ANALYSIS ---
-            if 'morning_end' in rules[t_type]:
+            if t_type in rules and 'morning_end' in rules[t_type]:
                 cutoff = rules[t_type]['morning_end']
 
                 # Demand right BEFORE cutoff (e.g. 13:00-14:00 for 14:00 cutoff)
@@ -176,7 +196,7 @@ def generate_recommendations(stats):
                 # (Meaning people are paying the higher Evening price, OR simply high demand)
                 if post_sales > (total_sales * 0.05) and post_sales > 5:
                      recommendations.append({
-                        'zone': z_type,
+                        'zone': z_name,
                         'tariff': t_type,
                         'msg': f"Продлить Утро до {format_time(cutoff+1)}",
                         'reason': f"Высокий спрос ({post_sales} чек.) в первый час Вечера ({format_time(cutoff)}-{format_time(cutoff+1)}).",
@@ -186,7 +206,7 @@ def generate_recommendations(stats):
                 # 2. SHORTEN? If last hour of Morning is dead
                 if pre_sales == 0 and total_sales > 10:
                      recommendations.append({
-                        'zone': z_type,
+                        'zone': z_name,
                         'tariff': t_type,
                         'msg': f"Сократить Утро до {format_time(cutoff-1)}",
                         'reason': f"Нет продаж в последний час Утра ({format_time(cutoff-1)}-{format_time(cutoff)}).",
@@ -194,22 +214,15 @@ def generate_recommendations(stats):
                     })
 
             # --- NIGHT START ANALYSIS ---
-            if 'start' in rules[t_type]: # Night Tariff
+            if t_type in rules and 'start' in rules[t_type]: # Night Tariff
                 start = rules[t_type]['start']
 
                 # Check hour BEFORE night starts (e.g. 21:00-22:00)
                 waiting_sales = hist[start-1]
 
-                # If very low sales before night, maybe people are waiting?
-                # Hard to say without comparing to other tariffs.
-                # But if Night sales at 22:00 are HUGE compared to 21:00 generic sales...
-                # We only see Night sales here.
-
                 # Check Night Peak
                 night_peak = hist[start]
                 if night_peak > 10 and waiting_sales == 0:
-                     # This logic is flawed because "waiting_sales" variable looks at NIGHT tariff sales at 21:00
-                     # which should be 0 anyway.
                      pass
 
     return sorted(recommendations, key=lambda x: x['priority'], reverse=True)
@@ -232,6 +245,7 @@ def generate_report(stats, recs):
             .badge-warn { background: #ffeb3b; }
             .badge-ok { background: #00e676; }
             h2 { color: #ff4d4d; margin-top: 0; }
+            h3 { color: #aaa; margin-bottom: 10px; }
         </style>
     </head>
     <body>
@@ -241,7 +255,7 @@ def generate_report(stats, recs):
             <h2>💡 Рекомендации</h2>
             <table>
                 <tr>
-                    <th>Тип Зоны</th>
+                    <th>Зона</th>
                     <th>Тариф</th>
                     <th>Совет</th>
                     <th>Причина</th>
@@ -264,8 +278,19 @@ def generate_report(stats, recs):
     html += "</table></div>"
 
     # --- CHARTS ---
-    for z_type, tariffs in stats.items():
-        html += f"<h2>{z_type} ZONES</h2>"
+    # Sort zones: Standard first, then Console
+    sorted_zones = sorted(stats.keys(), key=lambda x: (stats[x]['type'], x))
+
+    for z_name in sorted_zones:
+        z_data = stats[z_name]
+        z_type = z_data['type']
+        tariffs = z_data['tariffs']
+
+        html += f"<h2>{z_name} <span style='font-size:12px; color:#666'>({z_type})</span></h2>"
+        html += "<div style='display:flex; flex-wrap:wrap; gap:20px;'>"
+
+        # Determine rules for this zone type
+        current_rules = RULES.get(z_type, RULES['STANDARD'])
 
         for t_type, hours in tariffs.items():
             if not hours: continue
@@ -281,7 +306,7 @@ def generate_report(stats, recs):
             ))
 
             # Draw Current Windows
-            rule = RULES[z_type].get(t_type)
+            rule = current_rules.get(t_type)
             shapes = []
 
             if rule:
@@ -301,17 +326,21 @@ def generate_report(stats, recs):
                     shapes.append(dict(type="rect", x0=0, x1=ne, y0=0, y1=1, yref="paper", fillcolor="purple", opacity=0.2, line_width=0))
 
             fig.update_layout(
-                title=f"{t_type} - Распределение спроса",
+                title=f"{t_type}",
                 shapes=shapes,
                 plot_bgcolor='#1e1e1e',
                 paper_bgcolor='#1e1e1e',
                 font_color='#ccc',
-                height=300,
-                margin=dict(l=20, r=20, t=40, b=20),
-                xaxis=dict(title="Час дня (0-23)", dtick=1)
+                height=250,
+                width=400,
+                margin=dict(l=20, r=20, t=30, b=20),
+                xaxis=dict(title="Час (0-23)", dtick=2),
+                showlegend=False
             )
 
-            html += f"<div class='card'>{fig.to_html(full_html=False, include_plotlyjs=False)}</div>"
+            html += f"<div class='card' style='padding:10px;'>{fig.to_html(full_html=False, include_plotlyjs=False)}</div>"
+
+        html += "</div><hr style='border-color:#333'>"
 
     html += "</body></html>"
 
