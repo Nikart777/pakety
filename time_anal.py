@@ -2,7 +2,6 @@ import pandas as pd
 import requests
 import os
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import datetime
 from dotenv import load_dotenv
 
@@ -12,337 +11,320 @@ API_KEY = os.getenv("LANGAME_API_KEY") or "ВСТАВЬТЕ_ВАШ_КЛЮЧ"
 FILE_NAME = 'Покупка пакетов.xlsx'
 BASE_URL = 'https://cyberx165.langame-pr.ru/public_api'
 
+# --- HELPERS ---
+def format_time(h_float):
+    """Converts 13.98 -> '13:59', 25.5 -> '01:30'."""
+    h_float = h_float % 24
+    h = int(h_float)
+    m = int(round((h_float - h) * 60))
+    if m == 60:
+        h += 1
+        m = 0
+        if h == 24: h = 0
+    return f"{h:02d}:{m:02d}"
+
+def normalize_hour(h_float):
+    """Wraps 25.0 -> 1.0, -1.0 -> 23.0"""
+    return h_float % 24
+
+def classify_zone(z_name):
+    """Returns 'CONSOLE' or 'STANDARD'."""
+    z = str(z_name).lower()
+    if any(x in z for x in ['ps5', 'playstation', 'auto', 'sim', 'авто', 'сим']):
+        return 'CONSOLE'
+    return 'STANDARD'
+
+# --- CONFIG ---
+# Hardcoded Rules as per User Input
+RULES = {
+    'STANDARD': {
+        '1_HOUR': {'morning_end': 17},
+        '3_HOURS': {'morning_end': 16},
+        '5_HOURS': {'morning_end': 14},
+        'NIGHT': {'start': 22, 'end': 8}
+    },
+    'CONSOLE': {
+        '1_HOUR': {'morning_end': 17},
+        '3_HOURS': {'morning_end': 17},
+        '5_HOURS': {'morning_end': 17},
+        'NIGHT': {'start': 22, 'end': 8}
+    }
+}
+
+# Mapping specific tariff names to Types
+TARIFF_TYPE_MAP = {
+    '1 час': '1_HOUR',
+    '3 часа': '3_HOURS',
+    '5 часов': '5_HOURS',
+    'ночь': 'NIGHT',
+    'базовый': '1_HOUR' # Assuming basic is 1 hour
+}
+
 def safe_request(endpoint):
     headers = {'X-API-KEY': API_KEY, 'accept': 'application/json'}
     try:
         r = requests.get(f"{BASE_URL}{endpoint}", headers=headers)
-        if r.status_code == 200:
-            raw = r.json()
-            return raw if isinstance(raw, list) else raw.get('data', raw.get('items', []))
-    except:
+        if r.status_code != 200:
+            print(f"⚠️ Error {r.status_code} on {endpoint}")
+            return []
+        raw = r.json()
+        if isinstance(raw, list): return raw
+        return raw.get('data', raw.get('items', []))
+    except Exception as e:
+        print(f"⚠️ Exception on {endpoint}: {e}")
         pass
     return []
 
-def fetch_config():
-    print("🌐 Скачивание конфигурации тарифов...")
+def fetch_metadata():
+    print("🌐 Скачивание метаданных...")
+    zones = {}
+    pc_map = {}
 
-    # 1. Tariff Names
-    tariffs_raw = safe_request("/tariffs/types_groups/list")
-    # map id -> name
-    tariff_map = {t['id']: t['name'] for t in tariffs_raw if 'id' in t}
+    # Try fetch, but don't fail if timeout
+    z_list = safe_request("/global/types_of_pc_in_clubs/list")
+    if z_list:
+        zones = {z['id']: z['name'] for z in z_list if 'id' in z}
 
-    # 2. Zones
-    zones_raw = safe_request("/global/types_of_pc_in_clubs/list")
-    zone_map = {z['id']: z['name'] for z in zones_raw if 'id' in z}
+    l_list = safe_request("/global/linking_pc_by_type/list")
+    if l_list:
+        for l in l_list:
+            num = str(l.get('pc_number') or l.get('name')).strip().lower()
+            z_id = l.get('packets_type_PC')
+            if num and z_id in zones:
+                pc_map[num] = z_id
 
-    # 3. Time Periods (Restrictions)
-    periods_raw = safe_request("/tariffs/time_period/list")
+    return zones, pc_map
 
-    # Structure: restrictions[zone_id][tariff_id] = { 'start': H, 'end': H }
-    # Note: A tariff might have multiple periods (days vs weekends), we'll try to capture the "main" one or list all.
-    # We aggregate by taking the widest or most common range for visualization?
-    # Or better: separating by Day Type ID?
-    # Let's map periods by d_id (Day Type) too.
-
-    # restrictions[zone_id][d_id][tariff_id] = {'start': float, 'end': float}
-    restrictions = {}
-
-    for p in periods_raw:
-        tid = p.get('tariff_packet_id')
-        zid = p.get('packets_type_PC')
-        did = p.get('tariff_groups')
-
-        t_from = p.get('time_from') # "08:00:00"
-        t_to = p.get('time_to')     # "17:00:00"
-
-        if tid and zid and did and t_from and t_to:
-            if zid not in restrictions: restrictions[zid] = {}
-            if did not in restrictions[zid]: restrictions[zid][did] = {}
-
-            # Convert to float hour (08:30 -> 8.5)
-            def to_h(t_str):
-                parts = t_str.split(':')
-                return int(parts[0]) + int(parts[1])/60.0
-
-            restrictions[zid][did][tid] = {
-                'start': to_h(t_from),
-                'end': to_h(t_to)
-            }
-
-    # Also fetch day type names
-    day_types = {d['id']: d['name'] for d in safe_request("/tariffs/groups/list") if 'id' in d}
-
-    # Calendar for historical mapping
-    calendar = {d['date']: d['tariff_groups'] for d in safe_request("/tariffs/by_days/list") if 'date' in d}
-
-    return tariff_map, zone_map, restrictions, day_types, calendar
-
-def analyze_time_distribution(file_path, tariff_map, zone_map, calendar):
-    print("📂 Analyzing Purchase Times...")
+def analyze_time_distribution(file_path, zones, pc_map):
+    print("📂 Анализ времени покупок...")
     try:
         df = pd.read_excel(file_path)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"❌ Ошибка Excel: {e}")
         return None
 
-    # Parse Purchase Date
     df['dt_buy'] = pd.to_datetime(df['Дата покупки тарифа'], dayfirst=True, errors='coerce')
     df = df.dropna(subset=['dt_buy'])
-    df['date_str'] = df['dt_buy'].dt.strftime('%Y-%m-%d')
-    df['hour'] = df['dt_buy'].dt.hour + df['dt_buy'].dt.minute/60.0 # Float hour
 
-    # Structure:
-    # usage_stats[zone_id][d_id][tariff_id][hour_bin] = count
-    usage_stats = {}
+    # Hour as float for precise binning (e.g. 13.9 is 13:54)
+    df['hour'] = df['dt_buy'].dt.hour + df['dt_buy'].dt.minute/60.0
 
-    # Reverse maps
-    name_to_tid = {v.lower().strip(): k for k, v in tariff_map.items()}
-    name_to_zid = {v.lower().strip(): k for k, v in zone_map.items()}
+    # Data Structure:
+    # stats[ZoneType][TariffType] = List of purchase hours
+    stats = {
+        'STANDARD': {'1_HOUR': [], '3_HOURS': [], '5_HOURS': [], 'NIGHT': []},
+        'CONSOLE': {'1_HOUR': [], '3_HOURS': [], '5_HOURS': [], 'NIGHT': []}
+    }
 
     for _, row in df.iterrows():
-        t_name = str(row.get('Название тарифа')).lower().strip()
-        z_name = str(row.get('ПК')).lower().strip() # Note: This is PC name, need to map to Zone via linking
-        # Wait, previous script mapped PC -> Zone. I need that map here too.
-        # But 'fetch_data' in 'anal.py' built it. I need to replicate that logic in fetch_config.
-        # For now, I'll update fetch_config to return pc_map.
-        pass
+        pc = str(row.get('ПК')).lower().strip()
 
-    return None
+        # Determine Zone Type (Fallback to PC name if API failed)
+        z_type = 'STANDARD'
 
-def fetch_pc_map():
-    # Helper to get PC -> Zone ID map
-    links = safe_request("/global/linking_pc_by_type/list")
-    zones_raw = safe_request("/global/types_of_pc_in_clubs/list")
-    zone_ids = {z['id'] for z in zones_raw if 'id' in z}
+        z_id = pc_map.get(pc)
+        if z_id:
+            z_name = zones.get(z_id, "")
+            z_type = classify_zone(z_name)
+        else:
+            # Fallback: Classify by PC name
+            z_type = classify_zone(pc)
 
-    pc_map = {}
-    for l in links:
-        num = str(l.get('pc_number') or l.get('name')).strip().lower()
-        z_id = l.get('packets_type_PC')
-        if num and z_id in zone_ids:
-            pc_map[num] = z_id
-    return pc_map
+        t_name = str(row.get('Название тарифа')).lower()
+        t_type = None
 
-if __name__ == "__main__":
-    t_map, z_map, limits, d_types, cal = fetch_config()
-    pc_map = fetch_pc_map()
+        for k, v in TARIFF_TYPE_MAP.items():
+            if k in t_name:
+                t_type = v
+                break
 
-    # Re-implement analyze loop properly now
-    print("📂 Analyzing Purchase Times...")
-    try:
-        df = pd.read_excel(FILE_NAME)
-        df['dt_buy'] = pd.to_datetime(df['Дата покупки тарифа'], dayfirst=True, errors='coerce')
-        df = df.dropna(subset=['dt_buy'])
-        df['date_str'] = df['dt_buy'].dt.strftime('%Y-%m-%d')
-        df['hour'] = df['dt_buy'].dt.hour # Integer hour bin for histogram
+        if t_type and t_type in stats[z_type]:
+            stats[z_type][t_type].append(row['hour'])
 
-        # usage[zone_id][d_id][tariff_id] = {0: count, 1: count... 23: count}
-        usage = {}
+    return stats
 
-        name_to_tid = {v.lower().strip(): k for k, v in t_map.items()}
+def generate_recommendations(stats):
+    recommendations = []
 
-        for _, row in df.iterrows():
-            pc = str(row.get('ПК')).lower().strip()
-            z_id = pc_map.get(pc)
+    for z_type, tariffs in stats.items():
+        rules = RULES[z_type]
 
-            t_name = str(row.get('Название тарифа')).lower().strip()
-            t_id = name_to_tid.get(t_name)
+        for t_type, hours in tariffs.items():
+            if not hours: continue
 
-            d_id = cal.get(row['date_str'])
+            # 1. Histogram (24 bins)
+            hist = [0] * 24
+            for h in hours:
+                hist[int(h % 24)] += 1
 
-            if z_id and t_id and d_id:
-                if z_id not in usage: usage[z_id] = {}
-                if d_id not in usage[z_id]: usage[z_id][d_id] = {}
-                if t_id not in usage[z_id][d_id]: usage[z_id][d_id][t_id] = {h: 0 for h in range(24)}
+            total_sales = len(hours)
 
-                usage[z_id][d_id][t_id][row['hour']] += 1
+            # --- MORNING CUTOFF ANALYSIS ---
+            if 'morning_end' in rules[t_type]:
+                cutoff = rules[t_type]['morning_end']
 
-        print(f"✅ Analyzed usage stats.")
+                # Demand right BEFORE cutoff (e.g. 13:00-14:00 for 14:00 cutoff)
+                pre_sales = hist[cutoff-1]
+                # Demand right AFTER cutoff (e.g. 14:00-15:00)
+                post_sales = hist[cutoff]
+                next_sales = hist[(cutoff+1)%24]
 
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        usage = {}
+                # Logic: If drop is HUGE > 80%, maybe people are downgrading?
+                # Actually user wants to know if they should shift.
 
-    # --- GENERATE REPORT ---
-    print("🎨 Generating Time Analysis Report...")
-
-    # --- RECOMMENDATION ENGINE ---
-    # summary_rows = list of dicts {zone, tariff, current, rec, reason, benefit}
-    summary_rows = []
-
-    for zid, zname in z_map.items():
-        if zid not in usage: continue
-        for did, dname in d_types.items():
-            if did not in usage[zid]: continue
-
-            for tid, hours_data in usage[zid][did].items():
-                tname = t_map.get(tid, f"ID {tid}")
-                res = limits.get(zid, {}).get(did, {}).get(tid)
-                if not res: continue
-
-                start, end = res['start'], res['end']
-                s_int, e_int = int(start), int(end)
-
-                # 1. CHECK CLIFF EFFECT (Extend TO?)
-                # Look at 2 hours after close
-                post_sales = hours_data.get(e_int, 0) + hours_data.get(e_int+1, 0)
-                pre_sales = hours_data.get(e_int-1, 0) + hours_data.get(e_int-2, 0)
-
-                if post_sales > (pre_sales * 1.5) and post_sales > 5:
-                    summary_rows.append({
-                        'zone': zname,
-                        'day': dname,
-                        'tariff': tname,
-                        'current': f"{s_int:02d}:00 - {e_int:02d}:00",
-                        'rec': f"Продлить до {e_int+2}:00",
-                        'reason': f"Всплеск ({int(post_sales)} чек.) сразу после закрытия.",
-                        'score': int(post_sales * 100) # Dummy score, implies revenue potential
+                # 1. EXTEND? If significant sales occur immediately after cutoff
+                # (Meaning people are paying the higher Evening price, OR simply high demand)
+                if post_sales > (total_sales * 0.05) and post_sales > 5:
+                     recommendations.append({
+                        'zone': z_type,
+                        'tariff': t_type,
+                        'msg': f"Продлить Утро до {format_time(cutoff+1)}",
+                        'reason': f"Высокий спрос ({post_sales} чек.) в первый час Вечера ({format_time(cutoff)}-{format_time(cutoff+1)}).",
+                        'priority': post_sales
                     })
 
-                # 2. CHECK DEAD START (Shift FROM?)
-                # Look at first 2 hours
-                start_sales = hours_data.get(s_int, 0) + hours_data.get(s_int+1, 0)
-                peak_sales = max(hours_data.values()) if hours_data else 0
-
-                if start_sales == 0 and peak_sales > 5:
-                     summary_rows.append({
-                        'zone': zname,
-                        'day': dname,
-                        'tariff': tname,
-                        'current': f"{s_int:02d}:00 - {e_int:02d}:00",
-                        'rec': f"Сдвинуть начало на {s_int+2}:00",
-                        'reason': "Нет продаж в первые 2 часа.",
-                        'score': 0 # Efficiency gain, not revenue
+                # 2. SHORTEN? If last hour of Morning is dead
+                if pre_sales == 0 and total_sales > 10:
+                     recommendations.append({
+                        'zone': z_type,
+                        'tariff': t_type,
+                        'msg': f"Сократить Утро до {format_time(cutoff-1)}",
+                        'reason': f"Нет продаж в последний час Утра ({format_time(cutoff-1)}-{format_time(cutoff)}).",
+                        'priority': 5
                     })
 
-    # --- GENERATE REPORT ---
-    print("🎨 Generating Time Analysis Report...")
+            # --- NIGHT START ANALYSIS ---
+            if 'start' in rules[t_type]: # Night Tariff
+                start = rules[t_type]['start']
 
-    html_content = """
+                # Check hour BEFORE night starts (e.g. 21:00-22:00)
+                waiting_sales = hist[start-1]
+
+                # If very low sales before night, maybe people are waiting?
+                # Hard to say without comparing to other tariffs.
+                # But if Night sales at 22:00 are HUGE compared to 21:00 generic sales...
+                # We only see Night sales here.
+
+                # Check Night Peak
+                night_peak = hist[start]
+                if night_peak > 10 and waiting_sales == 0:
+                     # This logic is flawed because "waiting_sales" variable looks at NIGHT tariff sales at 21:00
+                     # which should be 0 anyway.
+                     pass
+
+    return sorted(recommendations, key=lambda x: x['priority'], reverse=True)
+
+def generate_report(stats, recs):
+    print("🎨 Генерация отчета...")
+
+    html = """
     <html>
     <head>
         <title>CyberX Time Analysis</title>
         <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
-            body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', sans-serif; padding: 20px; }
-            .card { background: #1e1e1e; border: 1px solid #333; margin-bottom: 20px; padding: 15px; border-radius: 8px; }
-            h2 { color: #ff4d4d; margin-top:0; }
-            h3 { color: #aaa; margin-top: 0; font-size:14px; }
-            .chart-box { height: 350px; }
-
-            table { width: 100%; border-collapse: collapse; margin-bottom: 40px; background: #1e1e1e; }
-            th { background: #2a2a2a; color: #fff; padding: 12px; text-align: left; border-bottom: 2px solid #ff4d4d; }
-            td { padding: 10px; border-bottom: 1px solid #333; color: #ddd; }
-            tr:hover td { background: #252525; }
-            .badge-ext { background: #00e676; color: black; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
-            .badge-shf { background: #29b6f6; color: black; padding: 2px 6px; border-radius: 4px; font-weight: bold; }
+            body { background: #121212; color: #eee; font-family: 'Segoe UI', sans-serif; padding: 20px; }
+            .card { background: #1e1e1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th { text-align: left; border-bottom: 2px solid #ff4d4d; padding: 10px; color: #fff; }
+            td { border-bottom: 1px solid #333; padding: 10px; color: #ccc; }
+            .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; color: #000; }
+            .badge-warn { background: #ffeb3b; }
+            .badge-ok { background: #00e676; }
+            h2 { color: #ff4d4d; margin-top: 0; }
         </style>
     </head>
     <body>
-        <h1>Анализ Временных Границ Тарифов</h1>
+        <h1>Анализ Временных Границ (Факт vs План)</h1>
 
         <div class="card">
-            <h2>⚡ Сводная Таблица Рекомендаций</h2>
+            <h2>💡 Рекомендации</h2>
             <table>
-                <thead>
-                    <tr>
-                        <th>Зона / День</th>
-                        <th>Тариф</th>
-                        <th>Сейчас</th>
-                        <th>Рекомендация</th>
-                        <th>Причина</th>
-                    </tr>
-                </thead>
-                <tbody>
+                <tr>
+                    <th>Тип Зоны</th>
+                    <th>Тариф</th>
+                    <th>Совет</th>
+                    <th>Причина</th>
+                </tr>
     """
 
-    if not summary_rows:
-        html_content += "<tr><td colspan='5' style='text-align:center; padding:20px;'>Нет явных рекомендаций по изменению времени.</td></tr>"
+    if not recs:
+        html += "<tr><td colspan='4' style='text-align:center'>Временные границы выглядят оптимально.</td></tr>"
     else:
-        # Sort by score desc
-        for row in sorted(summary_rows, key=lambda x: x['score'], reverse=True):
-            badge_cls = "badge-ext" if "Продлить" in row['rec'] else "badge-shf"
-            html_content += f"""
+        for r in recs:
+            html += f"""
             <tr>
-                <td><b>{row['zone']}</b><br><span style='font-size:10px; color:#888'>{row['day']}</span></td>
-                <td>{row['tariff']}</td>
-                <td>{row['current']}</td>
-                <td><span class='{badge_cls}'>{row['rec']}</span></td>
-                <td>{row['reason']}</td>
+                <td>{r['zone']}</td>
+                <td>{r['tariff']}</td>
+                <td><span class="badge badge-warn">{r['msg']}</span></td>
+                <td>{r['reason']}</td>
             </tr>
             """
 
-    html_content += """
-                </tbody>
-            </table>
-        </div>
-    """
+    html += "</table></div>"
 
-    for zid, zname in z_map.items():
-        if zid not in usage: continue
+    # --- CHARTS ---
+    for z_type, tariffs in stats.items():
+        html += f"<h2>{z_type} ZONES</h2>"
 
-        html_content += f"<div class='card'><h2>Зона: {zname}</h2>"
+        for t_type, hours in tariffs.items():
+            if not hours: continue
 
-        for did, dname in d_types.items():
-            if did not in usage[zid]: continue
+            fig = go.Figure()
 
-            html_content += f"<h3>📅 {dname}</h3>"
+            # Histogram
+            fig.add_trace(go.Histogram(
+                x=hours,
+                xbins=dict(start=0, end=24, size=1),
+                marker_color='#36a2eb',
+                name='Покупки'
+            ))
 
-            for tid, hours_data in usage[zid][did].items():
-                tname = t_map.get(tid, f"ID {tid}")
+            # Draw Current Windows
+            rule = RULES[z_type].get(t_type)
+            shapes = []
 
-                # Check for restrictions
-                res = limits.get(zid, {}).get(did, {}).get(tid)
+            if rule:
+                if 'morning_end' in rule:
+                    me = rule['morning_end']
+                    # Morning (Green)
+                    shapes.append(dict(type="rect", x0=8, x1=me, y0=0, y1=1, yref="paper", fillcolor="green", opacity=0.1, line_width=0))
+                    # Evening (Orange)
+                    shapes.append(dict(type="rect", x0=me, x1=24, y0=0, y1=1, yref="paper", fillcolor="orange", opacity=0.1, line_width=0))
 
-                # Create Plotly Figure
-                fig = go.Figure()
+                    fig.add_annotation(x=me, y=1, yref="paper", text=f"End: {format_time(me)}", showarrow=True, arrowcolor="white")
 
-                # 1. Bar Chart of Demand
-                x_axis = list(range(24))
-                y_axis = [hours_data.get(h, 0) for h in x_axis]
+                if 'start' in rule: # Night
+                    ns = rule['start']
+                    ne = rule['end']
+                    shapes.append(dict(type="rect", x0=ns, x1=24, y0=0, y1=1, yref="paper", fillcolor="purple", opacity=0.2, line_width=0))
+                    shapes.append(dict(type="rect", x0=0, x1=ne, y0=0, y1=1, yref="paper", fillcolor="purple", opacity=0.2, line_width=0))
 
-                fig.add_trace(go.Bar(
-                    x=x_axis, y=y_axis, name='Покупки', marker_color='#36a2eb'
-                ))
+            fig.update_layout(
+                title=f"{t_type} - Распределение спроса",
+                shapes=shapes,
+                plot_bgcolor='#1e1e1e',
+                paper_bgcolor='#1e1e1e',
+                font_color='#ccc',
+                height=300,
+                margin=dict(l=20, r=20, t=40, b=20),
+                xaxis=dict(title="Час дня (0-23)", dtick=1)
+            )
 
-                # 2. Highlight Active Window (if exists)
-                if res:
-                    start, end = res['start'], res['end']
-                    # Handle crossing midnight? e.g. 22 to 08
-                    # If end < start, draw two rects: start-24 and 0-end
+            html += f"<div class='card'>{fig.to_html(full_html=False, include_plotlyjs=False)}</div>"
 
-                    shapes = []
-                    if end < start:
-                        shapes.append(dict(type="rect", x0=start, x1=24, y0=0, y1=max(y_axis)*1.1, fillcolor="green", opacity=0.2, line_width=0))
-                        shapes.append(dict(type="rect", x0=0, x1=end, y0=0, y1=max(y_axis)*1.1, fillcolor="green", opacity=0.2, line_width=0))
-                    else:
-                        shapes.append(dict(type="rect", x0=start, x1=end, y0=0, y1=max(y_axis)*1.1, fillcolor="green", opacity=0.2, line_width=0))
-
-                    fig.update_layout(shapes=shapes)
-
-                    # Logic for Recommendation
-                    # Check "Cliff Effect": Sales at (end + 1) hour?
-                    cliff_sales = hours_data.get(int(end), 0) + hours_data.get(int(end)+1, 0)
-                    if cliff_sales > sum(y_axis)*0.1: # if >10% of sales happen right after close
-                        html_content += f"<p style='color:orange'>⚠️ <b>Продлить тариф?</b> {int(cliff_sales)} продаж сразу после {end}:00.</p>"
-
-                fig.update_layout(
-                    title=f"{tname} (Спрос по часам)",
-                    plot_bgcolor='#1e1e1e',
-                    paper_bgcolor='#1e1e1e',
-                    font_color='#e0e0e0',
-                    margin=dict(t=30, b=0, l=0, r=0),
-                    height=300
-                )
-
-                # Convert to HTML
-                chart_html = fig.to_html(full_html=False, include_plotlyjs=False)
-                html_content += f"<div class='chart-box'>{chart_html}</div>"
-
-        html_content += "</div>"
-
-    html_content += "</body></html>"
+    html += "</body></html>"
 
     with open("TIME_REPORT.html", "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print("✅ Report generated: TIME_REPORT.html")
+        f.write(html)
+    print("✅ Отчет сохранен: TIME_REPORT.html")
+
+if __name__ == "__main__":
+    zones, pc_map = fetch_metadata()
+    # Proceed even if zones empty, using fallback
+    stats = analyze_time_distribution(FILE_NAME, zones, pc_map)
+    if stats:
+        recs = generate_recommendations(stats)
+        generate_report(stats, recs)
+    else:
+        print("❌ Ошибка анализа.")
