@@ -558,8 +558,8 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
             </script>
     """
 
-    col_order_std = ['1_HOUR', '3_HOURS', '5_HOURS', 'NIGHT']
-    col_order_auto = ['1_HOUR', '2_HOURS', '3_HOURS']
+    col_order_std = [('1 ЧАС', '1_HOUR'), ('3 ЧАСА', '3_HOURS'), ('5 ЧАСОВ', '5_HOURS'), ('НОЧЬ', 'NIGHT')]
+    col_order_auto = [('1 ЧАС', '1_HOUR'), ('2 ЧАСА', '2_HOURS'), ('3 ЧАСА', '3_HOURS')]
 
     sorted_zones = sorted(zones.items(), key=lambda x: x[1])
 
@@ -567,7 +567,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
         if zid not in price_grid: continue
 
         is_autosim = 'авто' in zname.lower() or 'auto' in zname.lower()
-        col_order = col_order_auto if is_autosim else col_order_std
+        col_list = col_order_auto if is_autosim else col_order_std
 
         html += f"""
         <div class="zone-card">
@@ -576,7 +576,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                 <thead>
                     <tr>
                         <th style="text-align:left; padding-left:20px;">День недели</th>
-                        {"".join([f"<th>{c}</th>" for c in col_order])}
+                        {"".join([f"<th>{label}</th>" for label, code in col_list])}
                     </tr>
                 </thead>
                 <tbody>
@@ -588,7 +588,7 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
             dname = day_types.get(did, 'Day')
             html += f"<tr><td class='row-title'>{dname}</td>"
 
-            for t_code in col_order:
+            for t_label, t_code in col_list:
                 data = price_grid[zid].get(t_code, {}).get(did, {})
                 # Use default structure for missing data
                 default_slot = {'count':0, 'hours':0, 'cash':0, 'bonus':0}
@@ -601,9 +601,10 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
 
                 def render_cell(slot, label=None):
                     price = int(data.get(slot, 0))
-                    # Fallback for AutoSim if price is under 'day' in map but conceptually 'all_day'
+                    # Fallback for AutoSim if price is under 'day' or 'evening' in map but conceptually 'all_day'
                     if price == 0 and slot == 'all_day':
-                        price = int(data.get('day', 0))
+                        # Try finding any non-zero price in day/evening slots as fallback
+                        price = int(data.get('day', 0)) or int(data.get('evening', 0))
 
                     if price == 0: return "<span class='empty'>-</span>"
 
