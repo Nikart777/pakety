@@ -39,6 +39,7 @@ def fetch_data():
 
     # Фильтр тарифов (Берем только основные)
     keywords = {
+        'базовый': '1_HOUR',
         '1 час': '1_HOUR',
         '3 часа': '3_HOURS',
         '5 часов': '5_HOURS',
@@ -105,7 +106,7 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
         df = pd.read_excel(file_path)
     except Exception as e:
         print(f"Ошибка чтения Excel: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     # 1. Parsing dates
     df['dt_start'] = pd.to_datetime(df['Дата активации сессии'], dayfirst=True, errors='coerce')
@@ -130,6 +131,9 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
     # Retention
     phone_counts = {}
 
+    # PC Revenue stats for "Worst PCs"
+    pc_revenue = {} # {pc_name: {'cash':0, 'bonus':0, 'zone': z_id}}
+
     duration_map = { '1_HOUR': 1, '3_HOURS': 3, '5_HOURS': 5, 'NIGHT': 10 }
 
     for _, row in df.iterrows():
@@ -151,6 +155,12 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
         # Financials
         cash = float(row.get('Списано рублей', 0) or 0)
         bonus = float(row.get('Списано бонусов', 0) or 0)
+
+        # Aggregate PC Revenue
+        if pc:
+            if pc not in pc_revenue: pc_revenue[pc] = {'cash':0, 'bonus':0, 'zone': z_id}
+            pc_revenue[pc]['cash'] += cash
+            pc_revenue[pc]['bonus'] += bonus
 
         # --- TARIFF STATS ---
         if z_id and t_id in target_tariffs and d_id:
@@ -240,7 +250,7 @@ def analyze_excel(file_path, zones, target_tariffs, pc_map, t_name_map, calendar
     repeats = sum(1 for c in phone_counts.values() if c > 1)
     retention_rate = (repeats / len(phone_counts) * 100) if phone_counts else 0
 
-    return sales_stats, day_counts, group_hourly_stats, global_max_stats, retention_rate
+    return sales_stats, day_counts, group_hourly_stats, global_max_stats, retention_rate, pc_revenue
 
 # --- 3. РЕКОМЕНДАЦИИ И ОТЧЕТ ---
 def get_recommendation(peak_load_pct, avg_load_pct, bonus_share_pct, price, current_bonus_limit=0.15):
@@ -269,7 +279,7 @@ def get_recommendation(peak_load_pct, avg_load_pct, bonus_share_pct, price, curr
 
     return 'OK', price, ""
 
-def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_capacities, day_counts, group_hourly_stats, global_max_stats, retention_rate):
+def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_capacities, day_counts, group_hourly_stats, global_max_stats, retention_rate, pc_revenue):
     print("🎨 Рисуем отчет с доказательствами...")
 
     # --- CALCULATE AGGREGATES FOR DASHBOARD ---
@@ -300,31 +310,75 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
     total_revenue = total_revenue_cash + total_revenue_bonus
     bonus_share_global = (total_revenue_bonus / total_revenue * 100) if total_revenue else 0
 
-    # --- BUILD HEATMAP DATA ---
-    # Rows: Zones, Cols: Hours 0-23
-    heatmap_html = "<div style='overflow-x:auto;'><h3>Карта Максимальной Загрузки (Пик за период)</h3><table style='font-size:10px; width:100%; border-spacing: 2px; border-collapse: separate;'>"
-    heatmap_html += "<tr><td style='width:100px;'></td>" + "".join([f"<td style='text-align:center; color:#888;'>{h:02d}</td>" for h in range(24)]) + "</tr>"
+    # --- BUILD WORST PCs TABLE ---
+    # Sort by total revenue (cash + bonus)
+    worst_pcs = sorted(pc_revenue.items(), key=lambda x: (x[1]['cash'] + x[1]['bonus']))[:15]
 
-    for zid, zname in sorted(zones.items()):
-        if zid not in global_max_stats: continue
-        z_cap = zone_capacities.get(zid, 1)
-        heatmap_html += f"<tr><td style='color:#ddd; font-weight:bold; text-align:right; padding-right:10px;'>{zname}</td>"
-        for h in range(24):
-            val = global_max_stats[zid].get(h, 0)
-            # intensity 0-1
-            intensity = min(val / z_cap, 1.0) if z_cap > 0 else 0
+    worst_pc_html = """
+    <div style='margin-top:40px; border-top:1px solid #333; padding-top:20px;'>
+        <h3 style='color:#ff4d4d;'>📉 Топ-15 ПК с минимальной выручкой (Аутсайдеры)</h3>
+        <p style='color:#888; font-size:12px;'>Рекомендуется: проверить техническое состояние, периферию или рассмотреть перестановку.</p>
+        <table style='width:100%; max-width:800px; margin:0 auto; font-size:12px;'>
+            <thead>
+                <tr style='background:#252525; color:#fff;'>
+                    <th style='text-align:left; padding:8px;'>ПК</th>
+                    <th style='text-align:left; padding:8px;'>Зона</th>
+                    <th style='text-align:right; padding:8px;'>Выручка (₽)</th>
+                    <th style='text-align:right; padding:8px;'>Бонусы</th>
+                    <th style='text-align:right; padding:8px;'>Итого</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+    for pc_name, data in worst_pcs:
+        z_name = zones.get(data['zone'], 'Unknown')
+        total = data['cash'] + data['bonus']
+        worst_pc_html += f"""
+            <tr style='border-bottom:1px solid #333;'>
+                <td style='padding:8px; color:#fff; font-weight:bold;'>{pc_name}</td>
+                <td style='padding:8px; color:#aaa;'>{z_name}</td>
+                <td style='padding:8px; text-align:right; color:#00e676;'>{int(data['cash'])}</td>
+                <td style='padding:8px; text-align:right; color:#ff6384;'>{int(data['bonus'])}</td>
+                <td style='padding:8px; text-align:right; color:#fff;'>{int(total)}</td>
+            </tr>
+        """
+    worst_pc_html += "</tbody></table></div>"
 
-            bg = "#222"
-            val_fmt = f"{val}" if val > 0 else ""
+    # --- BUILD HEATMAP DATA (GROUPED BY DAY TYPE) ---
+    heatmap_html = ""
 
-            if intensity >= 0.9: bg = f"rgba(255, 0, 0, {intensity})" # Bright Red for >90%
-            elif intensity > 0.7: bg = f"rgba(255, 77, 77, {intensity})" # Red
-            elif intensity > 0.4: bg = f"rgba(255, 234, 0, {intensity})" # Yellow
-            elif intensity > 0: bg = f"rgba(0, 230, 118, {intensity})" # Green
+    # We want to show heatmaps for each Day Type present in group_hourly_stats
+    # Sort day types by ID usually puts Weekdays first then Weekends (depending on Langame config)
+    for d_id in sorted(group_hourly_stats.keys()):
+        d_name = day_types.get(d_id, f"Group {d_id}")
 
-            heatmap_html += f"<td style='background:{bg}; color:white; text-align:center; padding:4px; border-radius:2px;'>{val_fmt}</td>"
-        heatmap_html += "</tr>"
-    heatmap_html += "</table></div>"
+        heatmap_html += f"<div style='margin-bottom:30px; overflow-x:auto;'><h4>{d_name} - Пиковая Загрузка</h4><table style='font-size:10px; width:100%; border-spacing: 2px; border-collapse: separate;'>"
+        heatmap_html += "<tr><td style='width:100px;'></td>" + "".join([f"<td style='text-align:center; color:#888;'>{h:02d}</td>" for h in range(24)]) + "</tr>"
+
+        for zid, zname in sorted(zones.items()):
+            # Use group specific max stats
+            stats = group_hourly_stats[d_id].get(zid, {})
+            z_cap = zone_capacities.get(zid, 1)
+
+            heatmap_html += f"<tr><td style='color:#ddd; font-weight:bold; text-align:right; padding-right:10px;'>{zname}</td>"
+            for h in range(24):
+                # 'max' is the peak concurrency seen for this hour in this day group
+                val = stats.get(h, {}).get('max', 0)
+
+                # intensity 0-1
+                intensity = min(val / z_cap, 1.0) if z_cap > 0 else 0
+
+                bg = "#222"
+                val_fmt = f"{val}" if val > 0 else ""
+
+                if intensity >= 0.9: bg = f"rgba(255, 0, 0, {intensity})"
+                elif intensity > 0.7: bg = f"rgba(255, 77, 77, {intensity})"
+                elif intensity > 0.4: bg = f"rgba(255, 234, 0, {intensity})"
+                elif intensity > 0: bg = f"rgba(0, 230, 118, {intensity})"
+
+                heatmap_html += f"<td style='background:{bg}; color:white; text-align:center; padding:4px; border-radius:2px;'>{val_fmt}</td>"
+            heatmap_html += "</tr>"
+        heatmap_html += "</table></div>"
 
     html = f"""
     <html>
@@ -445,10 +499,12 @@ def generate_flyer_with_stats(zones, price_grid, sales_stats, day_types, zone_ca
                 <div class="chart-container" style="flex:0 0 300px;">
                     <canvas id="revChart"></canvas>
                 </div>
-                <div class="chart-container">
+                <div class="chart-container" style="overflow-y:auto; max-height:400px;">
                     {heatmap_html}
                 </div>
             </div>
+
+            {worst_pc_html}
 
             <div class="legend">
                 <span style="color:#00e676">▲ ПОВЫСИТЬ</span> = Пик >90% или Ср. >70% &nbsp;|&nbsp;
@@ -616,8 +672,8 @@ if __name__ == "__main__":
         print("❌ Ключ API не найден.")
     else:
         zones, targets, prices, dtypes, cal, pc_map, t_map, zone_caps = fetch_data()
-        stats, day_counts, group_stats, global_max, retention = analyze_excel(FILE_NAME, zones, targets, pc_map, t_map, cal)
+        stats, day_counts, group_stats, global_max, retention, pc_revenue = analyze_excel(FILE_NAME, zones, targets, pc_map, t_map, cal)
         if stats:
-            generate_flyer_with_stats(zones, prices, stats, dtypes, zone_caps, day_counts, group_stats, global_max, retention)
+            generate_flyer_with_stats(zones, prices, stats, dtypes, zone_caps, day_counts, group_stats, global_max, retention, pc_revenue)
         else:
             print("❌ Ошибка с Excel файлом")
