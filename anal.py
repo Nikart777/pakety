@@ -135,10 +135,10 @@ def load_config(file_path):
 
     return pc_map, price_grid, zone_capacity
 
-# --- 2. ЗАГРУЗКА КОНКУРЕНТОВ ---
+# --- 2. ЗАГРУЗКА КОНКУРЕНТОВ С ПРИОРИТЕТОМ ---
 def load_competitors(file_path):
     print(f"⚔️ Загрузка конкурентов из {file_path}...")
-    market_data = {} # {Zone: {TariffCode: {'fair': X, 'avg': Y, 'k': Z}}}
+    market_data = {} # {Zone: {TariffCode: [ {tags: {}, fair: X} ] }}
 
     if not os.path.exists(file_path):
         print(f"⚠️ Файл конкурентов {file_path} не найден. Работаем без рыночного фильтра.")
@@ -159,7 +159,16 @@ def load_competitors(file_path):
             t_code, _ = get_tariff_code(t_raw)
             if not t_code or not z_name: continue
 
-            # Calculate Avg (ignoring NaNs and 0s)
+            # Parse Tags from Name (Context)
+            tags = {}
+            name_lower = t_raw.lower()
+            if 'выходн' in name_lower: tags['day_type'] = 'выходные'
+            elif 'будн' in name_lower: tags['day_type'] = 'будни'
+
+            if 'вечер' in name_lower: tags['slot'] = 'evening'
+            elif 'день' in name_lower or 'днев' in name_lower: tags['slot'] = 'day'
+
+            # Calculate Avg
             prices = []
             for c in price_cols:
                 val = row.get(c)
@@ -175,16 +184,52 @@ def load_competitors(file_path):
                 fair_price = avg_price * k
 
                 if z_name not in market_data: market_data[z_name] = {}
-                market_data[z_name][t_code] = {
+                if t_code not in market_data[z_name]: market_data[z_name][t_code] = []
+
+                market_data[z_name][t_code].append({
+                    'tags': tags,
                     'fair': int(fair_price),
-                    'avg': int(avg_price),
-                    'k': k
-                }
+                    'avg': int(avg_price)
+                })
 
     except Exception as e:
         print(f"❌ Ошибка чтения конкурентов: {e}")
 
     return market_data
+
+def get_fair_price(market_entries, day_type, slot):
+    """
+    Finds the best matching fair price based on specificity.
+    Score: +2 for DayType match, +1 for Slot match.
+    """
+    if not market_entries: return None
+
+    best_entry = None
+    best_score = -1
+
+    for entry in market_entries:
+        score = 0
+        tags = entry['tags']
+
+        # Day Type Match
+        if 'day_type' in tags:
+            if tags['day_type'] == day_type: score += 2
+            else: score = -10 # Explicit mismatch is bad (e.g. looking for Weekday but found Weekend price)
+
+        # Slot Match
+        if 'slot' in tags:
+            if tags['slot'] == slot: score += 1
+            else: score = -10
+
+        if score > best_score:
+            best_score = score
+            best_entry = entry
+
+    # Allow fallback to Base (Score 0) only if we didn't find a mismatch
+    if best_score >= 0 and best_entry:
+        return best_entry
+
+    return None
 
 # --- 3. АНАЛИЗ EXCEL (SALES) ---
 def analyze_excel(file_path, pc_map, price_grid):
@@ -323,9 +368,8 @@ def analyze_excel(file_path, pc_map, price_grid):
 def get_recommendation(peak_load_pct, price, bonus_share_pct, market_info=None):
     """
     Returns (action_code, new_price, reason)
-    market_info: {'fair': X, 'avg': Y, 'k': Z} or None
+    market_info: {'fair': X, 'avg': Y}
     """
-    # 1. Base Logic (Internal Load)
     proposed_price = price
     action = 'OK'
     reason = ""
@@ -339,26 +383,21 @@ def get_recommendation(peak_load_pct, price, bonus_share_pct, market_info=None):
         action = 'PROMO'
         reason = f"Простой {peak_load_pct}%"
 
-    # 2. Market Guardrail
     if market_info:
         fair_price = market_info['fair']
 
-        # Case A: We want to raise price, but market is lower
+        # Guardrail UP
         if action == 'UP' and proposed_price > fair_price:
-            # Check if we are already above market
             if price >= fair_price:
-                # Dangerous to raise further
-                return 'WARN', price, f"Рынок ({fair_price}р) держит цену. Рост опасен."
+                return 'WARN', price, f"Рынок ({fair_price}р) держит. Рост опасен."
             else:
-                # Cap at fair price
                 proposed_price = fair_price
                 reason += f" (Лимит рынка {fair_price}р)"
 
-        # Case B: We are PROMO, check if we are significantly above market
+        # Guardrail PROMO warning
         if action == 'PROMO' and price > fair_price:
             reason += f". Выше рынка ({fair_price}р)!"
 
-    # 3. Bonus Logic (Low load, high bonus usage)
     if peak_load_pct <= 30 and bonus_share_pct >= 13 and action != 'PROMO':
         return 'BONUS_UP', price, "Лимит бонусов"
 
@@ -499,8 +538,8 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
                 p_data = price_grid[z_name].get(t_code, {}).get(d_type, {})
                 s_data = sales_stats.get(z_name, {}).get(t_code, {}).get(d_type, {})
 
-                # Market Data for this specific cell
-                mkt_info = market_data.get(z_name, {}).get(t_code)
+                # Market Lookup
+                market_entries = market_data.get(z_name, {}).get(t_code, [])
 
                 def render_cell(slot, label=None):
                     price = int(p_data.get(slot, 0))
@@ -539,7 +578,10 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
                     tot_rev_cell = cash + bonus
                     bon_pct = int(bonus / tot_rev_cell * 100) if tot_rev_cell > 0 else 0
 
-                    rec_action, rec_price, rec_reason = get_recommendation(peak_pct, price, bon_pct, mkt_info)
+                    # Smart Market Match
+                    mkt_entry = get_fair_price(market_entries, d_type, slot)
+
+                    rec_action, rec_price, rec_reason = get_recommendation(peak_pct, price, bon_pct, mkt_entry)
 
                     badge = ""
                     if rec_action == 'UP': badge = f"<div class='rec-up'>▲ {rec_price}</div>"
@@ -550,8 +592,8 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
                     lbl_html = f"<div style='font-size:9px; color:#555;'>{label}</div>" if label else ""
 
                     mkt_html = ""
-                    if mkt_info:
-                        mkt_html = f"<div class='mkt-info'>Fair: {mkt_info['fair']}</div>"
+                    if mkt_entry:
+                        mkt_html = f"<div class='mkt-info'>Fair: {mkt_entry['fair']}</div>"
 
                     return f"""
                     <div style='text-align:center;'>
