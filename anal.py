@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 FILE_NAME = 'Покупка пакетов.xlsx'
 PRICE_FILE = 'price.xlsx'
+COMPETITORS_FILE = 'competitors.xlsx'
 
 # Настройки чувствительности робота
 HIGH_LOAD_THRESHOLD = 0.80  # Если продаж > 80% от рекорда этой зоны -> ПОДНЯТЬ
@@ -42,44 +43,15 @@ def get_day_type(dt):
     # Tue-Thu are always Weekdays
     return 'будни'
 
-def get_time_slot(dt, t_code):
-    """
-    Determines 'day' vs 'evening' based on start time.
-    Standard:
-      - 5 Hours: Day < 14:00
-      - 3 Hours: Day < 16:00
-      - Others: Day < 17:00
-    Night: Always 'night'
-    AutoSim: Always 'all_day'
-    """
-    h = dt.hour
+def get_cutoff_hour(t_code):
+    """Returns the hour where Day ends and Evening starts."""
+    if t_code == '5_HOURS': return 14
+    if t_code == '3_HOURS': return 16
+    return 17
 
-    if t_code == 'NIGHT': return 'night'
-    if 'AUTOSIM' in t_code or 'HOURS' not in t_code:
-        # Fallback for AutoSim specific codes if any
-        pass
-
-    cutoff = 17
-    if t_code == '5_HOURS': cutoff = 14
-    if t_code == '3_HOURS': cutoff = 16
-
-    if 4 <= h < cutoff: return 'day'
-    return 'evening'
-
-# --- 1. ЗАГРУЗКА КОНФИГУРАЦИИ (PRICE.XLSX) ---
-def load_config(file_path):
-    print(f"🌐 Загрузка конфигурации из {file_path}...")
-    try:
-        df = pd.read_excel(file_path)
-    except Exception as e:
-        print(f"❌ Ошибка чтения Price.xlsx: {e}")
-        return {}, {}, {}, {}
-
-    pc_map = {} # {pc_name_normalized: zone_name}
-    price_grid = {} # {zone: {tariff_code: {day_type: {slot: price}}}}
-    zone_capacity = {} # {zone: count}
-
-    # Keyword mapping for tariffs
+def get_tariff_code(name_raw):
+    """Normalize tariff name to code."""
+    name_lower = normalize_name(name_raw)
     keywords = {
         'базовый': '1_HOUR',
         '1 час': '1_HOUR',
@@ -89,11 +61,40 @@ def load_config(file_path):
         'ночь': 'NIGHT'
     }
 
+    # AutoSim check
+    is_autosim = 'автосим' in name_lower
+
+    for kw, code in keywords.items():
+        if kw in name_lower:
+            return code, is_autosim
+
+    return None, False
+
+# --- 1. ЗАГРУЗКА КОНФИГУРАЦИИ (PRICE.XLSX) ---
+def load_config(file_path):
+    print(f"🌐 Загрузка конфигурации из {file_path}...")
+    try:
+        df = pd.read_excel(file_path)
+        df.columns = df.columns.str.strip()
+    except Exception as e:
+        print(f"❌ Ошибка чтения Price.xlsx: {e}")
+        return {}, {}, {}, {}
+
+    pc_map = {}
+    price_grid = {}
+    zone_capacity = {}
+
+    required_cols = ['Название', 'номера ПК', 'Тариф', 'тип дня недели', 'Время цены', 'Цена']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        print(f"❌ Ошибка: В файле {file_path} не найдены столбцы: {missing}")
+        return {}, {}, {}, {}
+
     for _, row in df.iterrows():
         z_name = str(row['Название']).strip()
         pcs_str = str(row.get('номера ПК', ''))
-        t_raw = str(row.get('Тариф', '')).lower()
-        d_type = str(row.get('тип дня недели', '')).lower() # будни/выходные
+        t_raw = str(row.get('Тариф', ''))
+        d_type = str(row.get('тип дня недели', '')).lower()
         time_range = str(row.get('Время цены', ''))
         price = float(row.get('Цена', 0))
 
@@ -106,23 +107,14 @@ def load_config(file_path):
             zone_capacity[z_name] = len(pcs)
 
         # 2. Identify Tariff Code
-        t_code = None
-        is_autosim = 'автосим' in t_raw
-
-        for kw, code in keywords.items():
-            if kw in t_raw:
-                t_code = code
-                break
-
+        t_code, is_autosim = get_tariff_code(t_raw)
         if not t_code: continue
 
-        # 3. Identify Time Slot (from 'Время цены')
-        # e.g. "08:00-17:00" -> day, "17:00-08:00" -> evening
-        # We rely on start hour
+        # 3. Identify Time Slot
         try:
             start_h = int(time_range.split('-')[0].split(':')[0])
         except:
-            start_h = 0 # Default
+            start_h = 0
 
         slot = 'day'
         if is_autosim:
@@ -130,14 +122,7 @@ def load_config(file_path):
         elif t_code == 'NIGHT':
             slot = 'night'
         else:
-            # Re-use dynamic cutoff logic for consistency,
-            # OR trust the explicit time range from excel?
-            # User said: "column Time Price... e.g. 8 to 17".
-            # Let's map 08:00 start -> day, 16:00/17:00 start -> evening.
-            cutoff = 17
-            if t_code == '5_HOURS': cutoff = 14
-            if t_code == '3_HOURS': cutoff = 16
-
+            cutoff = get_cutoff_hour(t_code)
             if 4 <= start_h < cutoff: slot = 'day'
             else: slot = 'evening'
 
@@ -146,12 +131,62 @@ def load_config(file_path):
         if t_code not in price_grid[z_name]: price_grid[z_name][t_code] = {}
         if d_type not in price_grid[z_name][t_code]: price_grid[z_name][t_code][d_type] = {}
 
-        # Overwrite/Set price
         price_grid[z_name][t_code][d_type][slot] = price
 
     return pc_map, price_grid, zone_capacity
 
-# --- 2. АНАЛИЗ EXCEL (SALES) ---
+# --- 2. ЗАГРУЗКА КОНКУРЕНТОВ ---
+def load_competitors(file_path):
+    print(f"⚔️ Загрузка конкурентов из {file_path}...")
+    market_data = {} # {Zone: {TariffCode: {'fair': X, 'avg': Y, 'k': Z}}}
+
+    if not os.path.exists(file_path):
+        print(f"⚠️ Файл конкурентов {file_path} не найден. Работаем без рыночного фильтра.")
+        return market_data
+
+    try:
+        df = pd.read_excel(file_path)
+        df.columns = df.columns.str.strip()
+
+        cols = df.columns.tolist()
+        price_cols = [c for c in cols if 'цена' in c.lower() and 'конкурент' in c.lower()]
+
+        for _, row in df.iterrows():
+            z_name = str(row.get('Ваша Зона', '')).strip()
+            t_raw = str(row.get('Тариф', '')).strip()
+            k = float(row.get('Ваш Коэффициент', 1.0))
+
+            t_code, _ = get_tariff_code(t_raw)
+            if not t_code or not z_name: continue
+
+            # Calculate Avg (ignoring NaNs and 0s)
+            prices = []
+            for c in price_cols:
+                val = row.get(c)
+                try:
+                    val = float(val)
+                    if val > 0 and not np.isnan(val):
+                        prices.append(val)
+                except:
+                    pass
+
+            if prices:
+                avg_price = sum(prices) / len(prices)
+                fair_price = avg_price * k
+
+                if z_name not in market_data: market_data[z_name] = {}
+                market_data[z_name][t_code] = {
+                    'fair': int(fair_price),
+                    'avg': int(avg_price),
+                    'k': k
+                }
+
+    except Exception as e:
+        print(f"❌ Ошибка чтения конкурентов: {e}")
+
+    return market_data
+
+# --- 3. АНАЛИЗ EXCEL (SALES) ---
 def analyze_excel(file_path, pc_map, price_grid):
     print("📂 Анализ продаж и подсчет чеков...")
     try:
@@ -160,39 +195,19 @@ def analyze_excel(file_path, pc_map, price_grid):
         print(f"❌ Ошибка чтения Excel: {e}")
         return None, None, None, None, None, None
 
-    # Parsing dates
     df['dt_start'] = pd.to_datetime(df['Дата активации сессии'], dayfirst=True, errors='coerce')
-    # Fallback
     if 'Дата покупки тарифа' in df.columns:
         df['dt_buy'] = pd.to_datetime(df['Дата покупки тарифа'], dayfirst=True, errors='coerce')
         df['dt_start'] = df['dt_start'].fillna(df['dt_buy'])
 
     df = df.dropna(subset=['dt_start'])
 
-    # Structures
-    # sales_stats[zone][tariff_code][day_type][slot] = {...}
     sales_stats = {}
-
-    # Daily Occupancy
     daily_occupancy = {}
-
-    # Retention
     phone_counts = {}
-
-    # PC Revenue
     pc_revenue = {}
 
     duration_map = { '1_HOUR': 1, '2_HOURS': 2, '3_HOURS': 3, '5_HOURS': 5, 'NIGHT': 10 }
-
-    # Keyword map for sales rows (same as config)
-    keywords = {
-        'базовый': '1_HOUR',
-        '1 час': '1_HOUR',
-        '2 часа': '2_HOURS',
-        '3 часа': '3_HOURS',
-        '5 часов': '5_HOURS',
-        'ночь': 'NIGHT'
-    }
 
     for _, row in df.iterrows():
         pc_raw = normalize_name(row.get('ПК'))
@@ -201,49 +216,35 @@ def analyze_excel(file_path, pc_map, price_grid):
         if not z_name: continue
 
         t_name = normalize_name(row.get('Название тарифа'))
-        t_code = None
-        is_autosim = 'автосим' in t_name
-
-        for kw, code in keywords.items():
-            if kw in t_name:
-                t_code = code
-                break
+        t_code, is_autosim = get_tariff_code(t_name)
 
         if not t_code: continue
 
         dt = row['dt_start']
-        d_type = get_day_type(dt) # 'будни' or 'выходные'
+        d_type = get_day_type(dt)
 
-        # Phone stats
         phone = str(row.get('Номер телефона гостя', ''))
         if len(phone) > 5:
             phone_counts[phone] = phone_counts.get(phone, 0) + 1
 
-        # Financials
         cash = float(row.get('Списано рублей', 0) or 0)
         bonus = float(row.get('Списано бонусов', 0) or 0)
 
-        # PC Revenue
         if pc_raw:
             if pc_raw not in pc_revenue: pc_revenue[pc_raw] = {'cash':0, 'bonus':0, 'zone': z_name}
             pc_revenue[pc_raw]['cash'] += cash
             pc_revenue[pc_raw]['bonus'] += bonus
 
-        # Time Slot
         slot = 'day'
         if is_autosim:
             slot = 'all_day'
         elif t_code == 'NIGHT':
             slot = 'night'
         else:
-            cutoff = 17
-            if t_code == '5_HOURS': cutoff = 14
-            if t_code == '3_HOURS': cutoff = 16
-
+            cutoff = get_cutoff_hour(t_code)
             if 4 <= dt.hour < cutoff: slot = 'day'
             else: slot = 'evening'
 
-        # Aggregation
         if z_name not in sales_stats: sales_stats[z_name] = {}
         if t_code not in sales_stats[z_name]: sales_stats[z_name][t_code] = {}
         if d_type not in sales_stats[z_name][t_code]:
@@ -261,8 +262,6 @@ def analyze_excel(file_path, pc_map, price_grid):
         bucket['cash'] += cash
         bucket['bonus'] += bonus
 
-        # --- OCCUPANCY ---
-        # Same minute-based logic as before
         est_end = row.get('Дата завершения сессии')
         if pd.isnull(est_end):
             est_end = dt + pd.Timedelta(hours=dur)
@@ -288,35 +287,24 @@ def analyze_excel(file_path, pc_map, price_grid):
 
             curr_h += pd.Timedelta(hours=1)
 
-    # Convert occupancy to stats
-    # Group stats by 'будни'/'выходные' ?
-    # The output report expects `group_hourly_stats[d_id]`.
-    # We used `d_id` (Day ID) before. Now we have 'будни' or 'выходные'.
-    # We can use these strings as keys.
-
     group_hourly_stats = {'будни': {}, 'выходные': {}}
     global_max_stats = {}
 
     for d_str, zones_data in daily_occupancy.items():
-        # Parse base date
         base_dt = datetime.datetime.strptime(d_str, '%Y-%m-%d')
 
         for z, hours in zones_data.items():
             if z not in global_max_stats: global_max_stats[z] = {h: 0 for h in range(24)}
 
             for h, mins in hours.items():
-                # Reconstruct full datetime to check Day Type for THIS specific hour
-                # This handles Friday split (14:00 is Weekday, 18:00 is Weekend) correctly
                 full_dt = base_dt.replace(hour=h)
                 d_type = get_day_type(full_dt)
 
-                # Init stats if missing
                 if z not in group_hourly_stats[d_type]:
                     group_hourly_stats[d_type][z] = {h: {'max':0, 'sum':0, 'count':0} for h in range(24)}
 
                 conc = mins / 60.0
 
-                # Update Stats
                 stats = group_hourly_stats[d_type][z][h]
                 stats['max'] = max(stats['max'], conc)
                 stats['sum'] += conc
@@ -324,47 +312,61 @@ def analyze_excel(file_path, pc_map, price_grid):
 
                 global_max_stats[z][h] = max(global_max_stats[z][h], conc)
 
-    # Retention
     repeats = sum(1 for c in phone_counts.values() if c > 1)
     retention_rate = (repeats / len(phone_counts) * 100) if phone_counts else 0
 
-    # Day Counts (for averaging if needed)
-    day_counts = {'будни': 1, 'выходные': 1} # Placeholder
+    day_counts = {'будни': 1, 'выходные': 1}
 
     return sales_stats, day_counts, group_hourly_stats, global_max_stats, retention_rate, pc_revenue
 
-# --- 3. РЕКОМЕНДАЦИИ И ОТЧЕТ ---
-def get_recommendation(peak_load_pct, avg_load_pct, bonus_share_pct, price, current_bonus_limit=0.15):
+# --- 4. РЕКОМЕНДАЦИИ С УЧЕТОМ РЫНКА ---
+def get_recommendation(peak_load_pct, price, bonus_share_pct, market_info=None):
     """
     Returns (action_code, new_price, reason)
-    Russian responses.
+    market_info: {'fair': X, 'avg': Y, 'k': Z} or None
     """
-    # 1. PEAK LOAD > 90% -> CRITICAL RAISE
+    # 1. Base Logic (Internal Load)
+    proposed_price = price
+    action = 'OK'
+    reason = ""
+
     if peak_load_pct >= 90:
-        new_price = int(price * 1.20 / 10) * 10
-        return 'UP', new_price, f"ПИКОВАЯ ЗАГРУЗКА ({int(peak_load_pct)}%) - СРОЧНО ПОДНЯТЬ"
+        proposed_price = int(price * 1.20 / 10) * 10
+        action = 'UP'
+        reason = f"Пик {peak_load_pct}%"
+    elif peak_load_pct <= 20:
+        proposed_price = int(price * 0.9 / 10) * 10
+        action = 'PROMO'
+        reason = f"Простой {peak_load_pct}%"
 
-    # 2. HIGH DEMAND (Avg > 70%) -> RAISE
-    if avg_load_pct >= 70:
-        new_price = int(price * 1.10 / 10) * 10
-        return 'UP', new_price, f"Высокий спрос ({int(avg_load_pct)}%)"
+    # 2. Market Guardrail
+    if market_info:
+        fair_price = market_info['fair']
 
-    # 3. LOW LOAD + HIGH BONUS DEMAND -> ALLOW MORE BONUSES
-    limit_pct = current_bonus_limit * 100
-    if avg_load_pct <= 30 and bonus_share_pct >= (limit_pct * 0.9):
-        return 'BONUS_UP', price, f"Низкая загр. ({int(avg_load_pct)}%), но бонусы популярны. Увеличьте лимит."
+        # Case A: We want to raise price, but market is lower
+        if action == 'UP' and proposed_price > fair_price:
+            # Check if we are already above market
+            if price >= fair_price:
+                # Dangerous to raise further
+                return 'WARN', price, f"Рынок ({fair_price}р) держит цену. Рост опасен."
+            else:
+                # Cap at fair price
+                proposed_price = fair_price
+                reason += f" (Лимит рынка {fair_price}р)"
 
-    # 4. CRITICAL LOW LOAD -> PROMO (LOWER PRICE)
-    if avg_load_pct <= 20 and peak_load_pct < 50:
-        new_price = int(price * 0.9 / 10) * 10
-        return 'PROMO', new_price, f"Простой ПК ({int(avg_load_pct)}%). Снизьте цену."
+        # Case B: We are PROMO, check if we are significantly above market
+        if action == 'PROMO' and price > fair_price:
+            reason += f". Выше рынка ({fair_price}р)!"
 
-    return 'OK', price, ""
+    # 3. Bonus Logic (Low load, high bonus usage)
+    if peak_load_pct <= 30 and bonus_share_pct >= 13 and action != 'PROMO':
+        return 'BONUS_UP', price, "Лимит бонусов"
 
-def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_hourly_stats, retention_rate, pc_revenue):
+    return action, proposed_price, reason
+
+def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_hourly_stats, retention_rate, pc_revenue, market_data):
     print("🎨 Рисуем отчет...")
 
-    # Calculate Totals
     total_sales = 0
     total_rev_c = 0
     total_rev_b = 0
@@ -381,7 +383,6 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
     total_rev = total_rev_c + total_rev_b
     bonus_share = (total_rev_b / total_rev * 100) if total_rev else 0
 
-    # Worst PCs
     worst_pcs = sorted(pc_revenue.items(), key=lambda x: (x[1]['cash'] + x[1]['bonus']))[:15]
     worst_pc_html = """
     <div style='margin-top:40px; border-top:1px solid #333; padding-top:20px;'>
@@ -394,7 +395,6 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
         worst_pc_html += f"<tr><td style='padding:8px;'>{pc}</td><td style='padding:8px;'>{d['zone']}</td><td style='text-align:right;'>{int(d['cash'])}</td><td style='text-align:right;'>{int(d['bonus'])}</td></tr>"
     worst_pc_html += "</tbody></table></div>"
 
-    # Heatmap
     heatmap_html = ""
     for d_type in ['будни', 'выходные']:
         heatmap_html += f"<div style='margin-bottom:30px;'><h4>{d_type.upper()} - Пиковая Загрузка</h4><table style='font-size:10px; width:100%; border-spacing: 2px;'>"
@@ -421,7 +421,7 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
     html = f"""
     <html>
     <head>
-        <title>CyberX Smart Price (Excel Config)</title>
+        <title>CyberX Smart Price (Market Aware)</title>
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             body {{ font-family: sans-serif; background: #121212; color: #ddd; padding: 20px; }}
@@ -438,14 +438,16 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
             .price-tag {{ font-size: 16px; font-weight: bold; color: white; display: block; }}
             .stats {{ font-size: 10px; color: #666; }}
             .rec-up {{ background: #00e676; color: #000; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }}
+            .rec-warn {{ background: #ff9800; color: #000; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }}
             .rec-promo {{ background: #29b6f6; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }}
             .rec-bonus {{ background: #ffea00; color: #000; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }}
             .empty {{ color: #444; }}
+            .mkt-info {{ font-size: 9px; color: #aaa; border-top: 1px dashed #444; margin-top: 4px; padding-top: 2px; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>Умный Прайс-Лист (Excel Source)</h1>
+            <h1>Умный Прайс-Лист (Анализ Рынка)</h1>
             <div class="dashboard">
                 <div class="kpi-card"><div class="kpi-val">{int(total_sales)}</div><div>Чеков</div></div>
                 <div class="kpi-card"><div class="kpi-val">{int(total_rev):,} ₽</div><div>Выручка</div></div>
@@ -469,7 +471,6 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
     col_order_std = [('1 ЧАС', '1_HOUR'), ('3 ЧАСА', '3_HOURS'), ('5 ЧАСОВ', '5_HOURS'), ('НОЧЬ', 'NIGHT')]
     col_order_auto = [('1 ЧАС', '1_HOUR'), ('2 ЧАСА', '2_HOURS'), ('3 ЧАСА', '3_HOURS')]
 
-    # Sort zones by name
     for z_name in sorted(price_grid.keys()):
         is_autosim = 'авто' in z_name.lower() or 'auto' in z_name.lower()
         col_list = col_order_auto if is_autosim else col_order_std
@@ -487,73 +488,43 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
                 <tbody>
         """
 
-        # Determine active day types for this zone from price_grid
-        # We expect 'будни' and 'выходные' usually
         active_days = set()
         for t in price_grid[z_name].values():
             active_days.update(t.keys())
 
-        # Sort so 'будни' comes before 'выходные'
-        for d_type in sorted(active_days, reverse=True): # 'выходные', 'будни' -> reverse=True makes 'будни' last? No.
-            # 'будни' < 'выходные' alphabetically? 'б' vs 'в'. Yes.
-            # So sorted() gives ['будни', 'выходные']. Perfect.
-
+        for d_type in sorted(active_days, reverse=True):
             html += f"<tr><td style='font-weight:bold; color:#ddd;'>{d_type.capitalize()}</td>"
 
             for lbl, t_code in col_list:
-                # Get Price Data
                 p_data = price_grid[z_name].get(t_code, {}).get(d_type, {})
-
-                # Get Sales Data
-                # Note: sales_stats has 'day', 'evening', 'night', 'all_day' buckets
                 s_data = sales_stats.get(z_name, {}).get(t_code, {}).get(d_type, {})
+
+                # Market Data for this specific cell
+                mkt_info = market_data.get(z_name, {}).get(t_code)
 
                 def render_cell(slot, label=None):
                     price = int(p_data.get(slot, 0))
                     if price == 0 and slot == 'all_day':
-                         # Fallback search
                          for k, v in p_data.items():
                              if v > 0: price = int(v); break
 
                     if price == 0: return "<span class='empty'>-</span>"
 
-                    # Stats
-                    # Aggregate if s_data is empty but key exists?
-                    # s_data is { 'day': {...}, 'evening': {...} }
-
                     if slot not in s_data:
-                        # Init empty
                         bucket = {'count':0, 'hours':0, 'cash':0, 'bonus':0}
                     else:
                         bucket = s_data[slot]
 
-                    count = bucket['count']
-                    hours = bucket['hours']
                     cash = bucket['cash']
                     bonus = bucket['bonus']
-
-                    # Load %
                     z_cap = zone_capacities.get(z_name, 1)
-                    # Duration of slot?
-                    slot_dur = 1
-                    if slot == 'day': slot_dur = 13 # rough
-                    elif slot == 'evening': slot_dur = 11
-                    elif slot == 'night': slot_dur = 10
-                    elif slot == 'all_day': slot_dur = 24
 
-                    total_cap = z_cap * slot_dur # * days_in_period?
-                    # We are aggregating ALL history. So we need number of days in history.
-                    # Simplified: We use relative load from group_hourly_stats max.
-
-                    # Peak Load from group stats
-                    # d_type is 'будни' or 'выходные'
-                    # slot determines hours
                     h_range = range(0,24)
                     if slot == 'day':
-                        cut = 16 if t_code == '3_HOURS' else (14 if t_code == '5_HOURS' else 17)
+                        cut = get_cutoff_hour(t_code)
                         h_range = range(4, cut)
                     elif slot == 'evening':
-                        cut = 16 if t_code == '3_HOURS' else (14 if t_code == '5_HOURS' else 17)
+                        cut = get_cutoff_hour(t_code)
                         h_range = list(range(cut, 24)) + list(range(0,4))
                     elif slot == 'night':
                         h_range = list(range(22, 24)) + list(range(0,8))
@@ -565,21 +536,22 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
 
                     peak_pct = int(max_conc / z_cap * 100) if z_cap > 0 else 0
 
-                    # Avg Load (Sold Hours / Total Capacity)
-                    # Use avg of sum occupancy?
-                    # Simplified: Use peak for recommendation
-
                     tot_rev_cell = cash + bonus
                     bon_pct = int(bonus / tot_rev_cell * 100) if tot_rev_cell > 0 else 0
 
-                    rec_action, rec_price, _ = get_recommendation(peak_pct, 0, bon_pct, price)
+                    rec_action, rec_price, rec_reason = get_recommendation(peak_pct, price, bon_pct, mkt_info)
 
                     badge = ""
                     if rec_action == 'UP': badge = f"<div class='rec-up'>▲ {rec_price}</div>"
                     elif rec_action == 'PROMO': badge = f"<div class='rec-promo'>▼ {rec_price}</div>"
                     elif rec_action == 'BONUS_UP': badge = f"<div class='rec-bonus'>★ BONUS</div>"
+                    elif rec_action == 'WARN': badge = f"<div class='rec-warn'>⚠ РЫНОК</div>"
 
                     lbl_html = f"<div style='font-size:9px; color:#555;'>{label}</div>" if label else ""
+
+                    mkt_html = ""
+                    if mkt_info:
+                        mkt_html = f"<div class='mkt-info'>Fair: {mkt_info['fair']}</div>"
 
                     return f"""
                     <div style='text-align:center;'>
@@ -587,6 +559,7 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
                         {badge}
                         <span class='price-tag'>{price}</span>
                         <span class='stats'>Pk:{peak_pct}% <span style='color:#ff6384'>B:{bon_pct}%</span></span>
+                        {mkt_html}
                     </div>
                     """
 
@@ -634,9 +607,11 @@ def generate_flyer_with_stats(price_grid, sales_stats, zone_capacities, group_ho
 
 if __name__ == "__main__":
     pc_map, price_grid, zone_capacities = load_config(PRICE_FILE)
+    market_data = load_competitors(COMPETITORS_FILE)
+
     if pc_map:
         stats, day_counts, group_stats, glob_max, ret, pc_rev = analyze_excel(FILE_NAME, pc_map, price_grid)
         if stats:
-            generate_flyer_with_stats(price_grid, stats, zone_capacities, group_stats, ret, pc_rev)
+            generate_flyer_with_stats(price_grid, stats, zone_capacities, group_stats, ret, pc_rev, market_data)
     else:
         print("❌ Не удалось загрузить конфигурацию.")
