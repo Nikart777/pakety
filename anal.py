@@ -298,26 +298,30 @@ def analyze_excel(file_path, pc_map, price_grid):
     global_max_stats = {}
 
     for d_str, zones_data in daily_occupancy.items():
-        dt_obj = datetime.datetime.strptime(d_str, '%Y-%m-%d')
-        # Check day type for this specific date?
-        # Note: The logic 'Fri 17:00' makes a single calendar DATE hybrid.
-        # But `daily_occupancy` is bucketed by `d_str` (Calendar Day).
-        # This is a slight mismatch.
-        # However, for heatmaps, grouping by "Mon/Tue/Wed" vs "Sat/Sun" is usually enough.
-        # Let's classify the whole date.
-        w = dt_obj.weekday()
-        d_type = 'выходные' if w >= 5 else 'будни' # Simplification for Heatmap aggregation
+        # Parse base date
+        base_dt = datetime.datetime.strptime(d_str, '%Y-%m-%d')
 
         for z, hours in zones_data.items():
-            if z not in group_hourly_stats[d_type]: group_hourly_stats[d_type][z] = {h: {'max':0, 'sum':0, 'count':0} for h in range(24)}
             if z not in global_max_stats: global_max_stats[z] = {h: 0 for h in range(24)}
 
             for h, mins in hours.items():
+                # Reconstruct full datetime to check Day Type for THIS specific hour
+                # This handles Friday split (14:00 is Weekday, 18:00 is Weekend) correctly
+                full_dt = base_dt.replace(hour=h)
+                d_type = get_day_type(full_dt)
+
+                # Init stats if missing
+                if z not in group_hourly_stats[d_type]:
+                    group_hourly_stats[d_type][z] = {h: {'max':0, 'sum':0, 'count':0} for h in range(24)}
+
                 conc = mins / 60.0
+
+                # Update Stats
                 stats = group_hourly_stats[d_type][z][h]
                 stats['max'] = max(stats['max'], conc)
                 stats['sum'] += conc
                 stats['count'] += 1
+
                 global_max_stats[z][h] = max(global_max_stats[z][h], conc)
 
     # Retention
